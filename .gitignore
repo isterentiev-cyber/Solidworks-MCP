@@ -1,0 +1,11 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.log
+*.rar
+config.local.json
+solidworks_mcp.log
+.env
+dist/
+build/
+*.egg-info/
