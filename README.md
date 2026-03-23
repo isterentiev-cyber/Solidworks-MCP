@@ -174,21 +174,6 @@ This server includes special handling for SolidWorks 2025 API changes:
 
 ---
 
-## 🗺️ Roadmap
-
-This project follows a 6-phase development plan:
-
-| Phase | Status | Description |
-|-------|--------|-------------|
-| Phase 1 | ✅ Complete | Foundation, modular architecture, 22 tools |
-| Phase 2 | 🔜 Planned | Advanced sketching, patterns, mirrors |
-| Phase 3 | 🔜 Planned | Assembly automation |
-| Phase 4 | 🔜 Planned | Drawing & annotation |
-| Phase 5 | 🔜 Planned | Simulation & analysis |
-| Phase 6 | 🔜 Planned | Production hardening, 55+ tools |
-
----
-
 ## 🤝 Contributing
 
 Contributions are welcome! Please:
