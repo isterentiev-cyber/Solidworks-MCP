@@ -59,8 +59,11 @@
 | **Features** | `fillet_edges` | Add fillets to selected edges |
 | **Features** | `chamfer_edges` | Add chamfers to selected edges |
 | **Features** | `list_features` | List all features in the model |
+| **Features** | `revolve_sketch` | Boss/Cut-Revolve the active sketch around its centerline |
 | **Utilities** | `set_units` | Change default unit (mm/inch/cm/m/ft) |
 | **Utilities** | `execute_python` | Execute custom Python code in SW context |
+| **Utilities** | `lookup_api_signature` | Get a COM method's real parameter list from SW's own type library (don't guess) |
+| **Utilities** | `lookup_api_constant` | Get a SW API constant's value from SW's own type library |
 
 ---
 

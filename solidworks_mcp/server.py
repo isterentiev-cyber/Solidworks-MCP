@@ -33,7 +33,7 @@ from mcp.types import Tool, TextContent
 from .automation import SolidWorksAutomation
 from .constants import SwErrors
 from .config import get_config, save_config
-from .utils import get_solidworks_info, set_default_unit, com_get
+from .utils import get_solidworks_info, set_default_unit, com_get, get_signature, get_constant
 
 # Configure logging
 config = get_config()
@@ -375,6 +375,36 @@ async def list_tools() -> list[Tool]:
                 "required": ["code"]
             }
         ),
+        Tool(
+            name="lookup_api_signature",
+            description=(
+                "Get the REAL parameter list of a SolidWorks COM method, generated "
+                "from SolidWorks' own type library (not memory/docs, which have been "
+                "wrong before -- see CLAUDE.md). Use this BEFORE guessing a param "
+                "count for any FeatureManager/SketchManager/etc. method you haven't "
+                "already confirmed working. First call generates a one-time cache "
+                "(~1-2s); later calls are instant."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "interface": {"type": "string", "description": "COM interface name, e.g. IFeatureManager, IModelDoc2, ISketchManager"},
+                    "member": {"type": "string", "description": "Method or property name, e.g. FeatureRevolve2"}
+                },
+                "required": ["interface", "member"]
+            }
+        ),
+        Tool(
+            name="lookup_api_constant",
+            description="Get the integer value of a SolidWorks API constant (e.g. swEndCondBlind, swRefPlaneReferenceConstraint_Distance) from SolidWorks' own constant type library, instead of guessing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Constant name, e.g. swRefPlaneReferenceConstraint_Distance"}
+                },
+                "required": ["name"]
+            }
+        ),
     ]
 
 
@@ -572,7 +602,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result = sw_automation._result(False, "Code is required", SwErrors.swInvalidInput)
             else:
                 result = _execute_python_fixed(code)
-        
+
+        elif name == "lookup_api_signature":
+            result = _lookup_api_signature_handler(
+                arguments.get("interface", ""), arguments.get("member", "")
+            )
+
+        elif name == "lookup_api_constant":
+            result = _lookup_api_constant_handler(arguments.get("name", ""))
+
         else:
             result = sw_automation._result(False, f"Unknown tool: {name}", SwErrors.swUnknownError)
         
@@ -781,6 +819,68 @@ def _list_features_fixed() -> Dict:
             "error_name": "swUnknownError",
             "data": {}
         }
+
+# ============================================================================
+# NEW: API typelib lookup handlers (see utils/typelib.py, CLAUDE.md)
+# ============================================================================
+
+def _lookup_api_signature_handler(interface: str, member: str) -> Dict:
+    """Look up a COM method/property's real signature via the SW typelib."""
+    if not interface or not member:
+        return {
+            "success": False,
+            "message": "Both 'interface' and 'member' are required",
+            "error_code": SwErrors.swInvalidInput,
+            "error_name": "swInvalidInput",
+            "data": {},
+        }
+    try:
+        sig = get_signature(interface, member)
+        return {
+            "success": True,
+            "message": f"{interface}.{member}",
+            "error_code": 0,
+            "error_name": "swSuccess",
+            "data": {"signature": sig},
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "error_code": SwErrors.swUnknownError,
+            "error_name": "swUnknownError",
+            "data": {},
+        }
+
+
+def _lookup_api_constant_handler(name: str) -> Dict:
+    """Look up a SolidWorks API constant's value via the constant typelib."""
+    if not name:
+        return {
+            "success": False,
+            "message": "'name' is required",
+            "error_code": SwErrors.swInvalidInput,
+            "error_name": "swInvalidInput",
+            "data": {},
+        }
+    try:
+        value = get_constant(name)
+        return {
+            "success": True,
+            "message": f"{name} = {value}",
+            "error_code": 0,
+            "error_name": "swSuccess",
+            "data": {"name": name, "value": value},
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "error_code": SwErrors.swUnknownError,
+            "error_name": "swUnknownError",
+            "data": {},
+        }
+
 
 # ============================================================================
 # NEW: close_sketch handler
