@@ -33,7 +33,7 @@ from mcp.types import Tool, TextContent
 from .automation import SolidWorksAutomation
 from .constants import SwErrors
 from .config import get_config, save_config
-from .utils import get_solidworks_info, set_default_unit
+from .utils import get_solidworks_info, set_default_unit, com_get
 
 # Configure logging
 config = get_config()
@@ -657,58 +657,54 @@ def _list_features_fixed() -> Dict:
             return err
         
         features = []
-        
-        # FIXED: FirstFeature is a property in SW 2025 COM, not a method
-        try:
-            feat = doc.FirstFeature
-        except AttributeError:
-            feat = doc.FirstFeature()
-        
+
+        # FirstFeature: property on some SW versions, zero-arg method on
+        # others -- com_get() reads it correctly either way.
+        feat = com_get(doc, "FirstFeature")
+
         while feat is not None:
             try:
-                name = ""
-                feat_type = ""
-                suppressed = False
-                
                 try:
                     name = feat.Name
                 except:
                     name = "<unknown>"
-                
-                # FIXED: GetTypeName2 is a property in SW 2025 COM
+
                 try:
-                    feat_type = feat.GetTypeName2
-                    if callable(feat_type):
-                        feat_type = feat_type()
+                    feat_type = com_get(feat, "GetTypeName2")
                 except:
                     try:
-                        feat_type = feat.GetTypeName()
+                        feat_type = com_get(feat, "GetTypeName")
                     except:
                         feat_type = "<unknown>"
-                
+
                 try:
-                    suppressed = feat.IsSuppressed()
+                    suppressed = com_get(feat, "IsSuppressed")
                 except:
                     suppressed = False
-                
+
                 features.append({
                     "name": name,
                     "type": feat_type,
                     "suppressed": bool(suppressed)
                 })
-                
+
             except Exception as e:
                 features.append({
                     "name": "<error>",
                     "type": str(e),
                     "suppressed": False
                 })
-            
-            # FIXED: GetNextFeature is a property in SW 2025 COM
+
+            # NOTE: do NOT use `if callable(feat): feat = feat()` here.
+            # win32com.client.CDispatch objects (including the already-
+            # resolved next feature) are always callable, so that check
+            # can't tell "still need a call" from "already have the
+            # feature" -- calling the latter raises a COM error that
+            # looks like "no more items" and stops the walk after one
+            # feature. com_get() tries the call and falls back to the
+            # pre-call value when it fails, which handles both cases.
             try:
-                feat = feat.GetNextFeature
-                if callable(feat):
-                    feat = feat()
+                feat = com_get(feat, "GetNextFeature")
             except:
                 break
         

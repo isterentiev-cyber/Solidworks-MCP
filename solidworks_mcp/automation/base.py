@@ -17,7 +17,7 @@ import pythoncom
 
 from ..constants import SwErrors, SwPlanes, SwDocumentTypes, SwViews
 from ..config import get_config
-from ..utils import UnitConverter, find_solidworks, find_template
+from ..utils import UnitConverter, find_solidworks, find_template, com_get
 
 logger = logging.getLogger(__name__)
 
@@ -261,19 +261,13 @@ class SolidWorksAutomation:
     def _get_doc_title(self, doc) -> str:
         """Get document title (handles property/method difference)"""
         try:
-            title = doc.GetTitle
-            if callable(title):
-                return title()
-            return title
+            return com_get(doc, "GetTitle")
         except:
             return "Unknown"
-    
+
     def _get_doc_path(self, doc) -> str:
         """Get document path (handles property/method difference)"""
         try:
-            path = doc.GetPathName
-            if callable(path):
-                return path()
-            return path
+            return com_get(doc, "GetPathName")
         except:
             return ""

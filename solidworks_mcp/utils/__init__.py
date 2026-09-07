@@ -20,6 +20,8 @@ from .sw_finder import (
     get_solidworks_info,
 )
 
+from .com_helpers import com_get, com_call
+
 __all__ = [
     # Units
     "Unit",
@@ -34,4 +36,8 @@ __all__ = [
     "find_solidworks",
     "find_template",
     "get_solidworks_info",
+
+    # COM access helpers
+    "com_get",
+    "com_call",
 ]
