@@ -14,3 +14,8 @@ pywin32==312
 
 # .env loading
 python-dotenv==1.2.2
+
+# BMP->PNG conversion for capture_view (SaveBMP is the only reliable
+# cross-version SW screenshot API; PNG is what downstream vision/OCR
+# consumers expect)
+pillow==12.3.0

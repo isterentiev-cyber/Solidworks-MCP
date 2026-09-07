@@ -128,7 +128,32 @@ async def list_tools() -> list[Tool]:
             description="List all open documents.",
             inputSchema={"type": "object", "properties": {}, "required": []}
         ),
-        
+        Tool(
+            name="capture_view",
+            description=(
+                "Screenshot the active document's current view to a PNG file. "
+                "Use this to get an image of a part/assembly for visual "
+                "inspection (read the returned path with the Read tool) before "
+                "cross-checking your visual read against list_features / "
+                "execute_python geometry data."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "output_path": {"type": "string", "description": "Where to save the PNG (default: <part folder>/_screenshots/<title>_<timestamp>.png)"},
+                    "view": {
+                        "type": "string",
+                        "enum": ["isometric", "front", "back", "left", "right", "top", "bottom", "trimetric", "dimetric"],
+                        "description": "Named view to switch to before capturing (default: current view)"
+                    },
+                    "width": {"type": "integer", "description": "Capture width in pixels (default from config, 1920)"},
+                    "height": {"type": "integer", "description": "Capture height in pixels (default from config, 1080)"},
+                    "zoom_to_fit": {"type": "boolean", "default": True, "description": "Zoom to fit the model before capturing"}
+                },
+                "required": []
+            }
+        ),
+
         # Sketch Tools
         Tool(
             name="create_sketch",
@@ -397,6 +422,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         elif name == "get_document_info":
             result = sw_automation.get_document_info()
+
+        elif name == "capture_view":
+            result = sw_automation.capture_view(
+                output_path=arguments.get("output_path"),
+                view=arguments.get("view"),
+                width=arguments.get("width"),
+                height=arguments.get("height"),
+                zoom_to_fit=arguments.get("zoom_to_fit", True),
+            )
         
         elif name == "list_open_documents":
             result = sw_automation.list_open_documents()

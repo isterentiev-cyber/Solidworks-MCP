@@ -46,6 +46,7 @@
 | **Documents** | `close_document` | Close the active document |
 | **Documents** | `save_document` | Save the active document |
 | **Documents** | `list_open_documents` | List all open documents |
+| **Documents** | `capture_view` | Screenshot the active view to PNG (for visual inspection / lexical indexing) |
 | **Sketches** | `create_sketch` | Create a sketch on a plane (Front/Top/Right) |
 | **Sketches** | `close_sketch` | Exit the active sketch |
 | **Sketches** | `draw_circle` | Draw a circle by center and radius |
