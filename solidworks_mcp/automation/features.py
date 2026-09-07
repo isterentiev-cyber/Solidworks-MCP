@@ -290,7 +290,88 @@ class FeatureOperations:
         except Exception as e:
             logger.error(f"Extrude error: {e}\n{traceback.format_exc()}")
             return self._result(False, f"Error: {e}", SwErrors.swFeatureError)
-    
+
+    # ========================================================================
+    # Revolve
+    # ========================================================================
+
+    def revolve_sketch(self, angle: float = 360, cut: bool = False) -> Dict:
+        """
+        Revolve the active sketch around its centerline (Boss/Cut-Revolve).
+        The sketch must contain exactly one centerline -- FeatureRevolve2
+        picks it up automatically as the revolve axis without an explicit
+        selection.
+
+        FeatureRevolve2's real signature is 20 positional params (confirmed
+        against the SolidWorks typelib via makepy -- see CLAUDE.md "makepy"
+        section). Earlier attempts at 18 and 21 params both failed
+        (`Parameter not optional` / `Invalid number of parameters`); the
+        two commonly-missed ones are OffsetDistance1/OffsetDistance2,
+        which sit between OffsetReverse2 and ThinType.
+
+        Args:
+            angle: Revolve angle in degrees (360 = full revolve)
+            cut: True for a cut-revolve (remove material) instead of boss
+
+        Returns:
+            Result dictionary
+        """
+        try:
+            import math
+            doc, err = self.get_active_doc()
+            if err:
+                return err
+
+            success, sketch_name, error_msg = self._close_and_select_sketch(doc)
+            if not success:
+                sketch_info = self._get_sketch_info(doc)
+                return self._result(False,
+                    f"Revolve failed: {error_msg}. "
+                    f"Sketches found: {sketch_info['sketch_count']} {sketch_info['sketch_names']}. "
+                    f"Sketch needs exactly one centerline as the revolve axis.",
+                    SwErrors.swFeatureError,
+                    {"diagnostics": sketch_info})
+
+            angle_rad = math.radians(angle)
+
+            feat = None
+            try:
+                feat = doc.FeatureManager.FeatureRevolve2(
+                    True,           # SingleDir
+                    not cut,        # IsSolid
+                    False,          # IsThin
+                    cut,            # IsCut
+                    False,          # ReverseDir
+                    False,          # BothDirectionUpToSameEntity
+                    0, 0,           # Dir1Type, Dir2Type (0 = blind/angle-driven)
+                    angle_rad, 0.0, # Dir1Angle, Dir2Angle
+                    False, False,   # OffsetReverse1, OffsetReverse2
+                    0.0, 0.0,       # OffsetDistance1, OffsetDistance2
+                    0,              # ThinType
+                    0.0, 0.0,       # ThinThickness1, ThinThickness2
+                    True, True, True  # Merge, UseFeatScope, UseAutoSelect
+                )
+            except Exception as e:
+                logger.debug(f"FeatureRevolve2 failed: {e}")
+
+            if feat is None:
+                sketch_info = self._get_sketch_info(doc)
+                return self._result(False,
+                    f"Revolve failed on sketch '{sketch_name}'. "
+                    f"Needs a closed profile plus exactly one centerline "
+                    f"(construction line) as the axis.",
+                    SwErrors.swFeatureError,
+                    {"sketch_name": sketch_name, "diagnostics": sketch_info})
+
+            kind = "Cut-Revolve" if cut else "Revolve"
+            return self._result(True, f"{kind}: {angle}°",
+                              SwErrors.swSuccess,
+                              {"angle": angle, "cut": cut, "sketch_name": sketch_name})
+
+        except Exception as e:
+            logger.error(f"Revolve error: {e}\n{traceback.format_exc()}")
+            return self._result(False, f"Error: {e}", SwErrors.swFeatureError)
+
     # ========================================================================
     # Cut Extrude
     # ========================================================================
@@ -495,16 +576,22 @@ class FeatureOperations:
             doc, err = self.get_active_doc()
             if err:
                 return err
-            
+
             import math
             dist_m = self._units.to_meters(distance, unit)
             angle_rad = math.radians(angle)
-            
+
             feat = None
-            
+
             try:
+                # InsertFeatureChamfer takes 8 params, confirmed against the
+                # real typelib (see CLAUDE.md "makepy" section) --
+                # (Options, ChamferType, Width, Angle, OtherDist,
+                # VertexChamDist1, VertexChamDist2, VertexChamDist3).
+                # ChamferType=0 is angle-distance (Width + Angle); the trailing
+                # three VertexChamDist args only apply to vertex chamfers.
                 feat = doc.FeatureManager.InsertFeatureChamfer(
-                    1, dist_m, angle_rad, dist_m, 0, False, False
+                    0, 0, dist_m, angle_rad, 0.0, 0.0, 0.0, 0.0
                 )
             except Exception as e:
                 logger.debug(f"InsertFeatureChamfer failed: {e}")

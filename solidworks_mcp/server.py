@@ -276,6 +276,22 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="revolve_sketch",
+            description=(
+                "Revolve the active sketch around its centerline (Boss/Cut-Revolve). "
+                "The sketch must contain exactly one centerline as the axis, plus a "
+                "closed profile on one side of it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "angle": {"type": "number", "default": 360, "description": "Revolve angle in degrees"},
+                    "cut": {"type": "boolean", "default": False, "description": "Cut-revolve instead of boss-revolve"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
             name="cut_extrude",
             description="Cut extrude to remove material.",
             inputSchema={
@@ -500,6 +516,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 arguments.get("unit")
             )
         
+        elif name == "revolve_sketch":
+            result = sw_automation.revolve_sketch(
+                arguments.get("angle", 360),
+                arguments.get("cut", False)
+            )
+
         elif name == "cut_extrude":
             result = sw_automation.cut_extrude(
                 arguments.get("depth", 10),
