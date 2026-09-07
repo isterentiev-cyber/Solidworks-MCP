@@ -85,8 +85,16 @@ class ViewCaptureOperations:
                 safe_title = "".join(c if c.isalnum() or c in "-_ " else "_"
                                       for c in title).strip() or "part"
                 doc_path = self._get_doc_path(doc)
-                base_dir = os.path.join(os.path.dirname(doc_path), "_screenshots") \
-                    if doc_path else os.path.join(os.getcwd(), "_screenshots")
+                if doc_path:
+                    base_dir = os.path.join(os.path.dirname(doc_path), "_screenshots")
+                else:
+                    # Unsaved document: os.getcwd() is whatever directory the
+                    # SolidWorks process happened to start in (often a
+                    # non-writable system dir like C:\Windows\System32, not
+                    # this script's cwd) -- fall back to somewhere always
+                    # writable instead of guessing.
+                    base_dir = os.path.join(os.path.expanduser("~"),
+                                             "SolidWorks_Screenshots")
                 os.makedirs(base_dir, exist_ok=True)
                 stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 output_path = os.path.join(base_dir, f"{safe_title}_{stamp}.png")

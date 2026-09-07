@@ -271,3 +271,37 @@ class SolidWorksAutomation:
             return com_get(doc, "GetPathName")
         except:
             return ""
+
+    # GetUserPreferenceStringValue index for each doc type's default
+    # template, confirmed empirically against a live app (see CLAUDE.md) --
+    # find_template()'s hardcoded "SOLIDWORKS 20XX" disk paths go stale
+    # every year and don't cover every install layout, so asking the
+    # running app for its own configured default is the primary source
+    # of truth; disk search stays as a fallback for when nothing's running.
+    _TEMPLATE_PREF_INDEX = {"part": 8, "assembly": 9, "drawing": 10}
+
+    def _get_template(self, doc_type: str) -> Optional[str]:
+        """
+        Resolve the default template path for a document type.
+
+        Tries disk-based find_template() first (respects config.exe_path /
+        an explicit override), then falls back to the live app's own
+        configured default template. Returns None if neither finds a real
+        file -- callers must handle that explicitly (NewDocument("", ...)
+        fails with swFileLoadError, it does NOT mean "use SW's default").
+        """
+        template = find_template(doc_type)
+        if template and os.path.exists(template):
+            return template
+
+        if self._sw_app is not None:
+            idx = self._TEMPLATE_PREF_INDEX.get(doc_type)
+            if idx is not None:
+                try:
+                    candidate = self._sw_app.GetUserPreferenceStringValue(idx)
+                    if candidate and os.path.exists(candidate):
+                        return candidate
+                except Exception as e:
+                    logger.debug(f"GetUserPreferenceStringValue({idx}) failed: {e}")
+
+        return None

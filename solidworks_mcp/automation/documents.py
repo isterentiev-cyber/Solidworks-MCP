@@ -13,7 +13,7 @@ import win32com.client
 import pythoncom
 
 from ..constants import SwErrors, SwDocumentTypes, SwFileTypes
-from ..utils import find_template, com_get
+from ..utils import com_get
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +43,23 @@ class DocumentOperations:
                 if not r["success"]:
                     return r
             
-            # Find part template
-            template = find_template("part")
+            # Find part template. NewDocument("", ...) is NOT "use SW's
+            # default" -- it fails with swFileLoadError, so a real path is
+            # required (see _get_template in base.py).
+            template = self._get_template("part")
             if not template:
-                template = ""  # Let SolidWorks use default
-                logger.info("Using SolidWorks default part template")
-            else:
-                logger.info(f"Using template: {template}")
-            
+                return self._result(False,
+                    "No part template found (disk search and the running "
+                    "app's own default template preference both came up "
+                    "empty). Set exe_path/part_template in config, or set "
+                    "a default part template in SW's own "
+                    "Options > Default Templates.",
+                    SwErrors.swTemplateNotFound)
+            logger.info(f"Using template: {template}")
+
             # Create document
             doc = self._sw_app.NewDocument(template, 0, 0, 0)
-            
+
             if doc is None:
                 return self._result(False, "Failed to create part document",
                                   SwErrors.swFileLoadError)
@@ -88,12 +94,18 @@ class DocumentOperations:
                 if not r["success"]:
                     return r
             
-            template = find_template("assembly")
+            template = self._get_template("assembly")
             if not template:
-                template = ""
-            
+                return self._result(False,
+                    "No assembly template found (disk search and the "
+                    "running app's own default template preference both "
+                    "came up empty). Set exe_path/assembly_template in "
+                    "config, or set a default assembly template in SW's "
+                    "own Options > Default Templates.",
+                    SwErrors.swTemplateNotFound)
+
             doc = self._sw_app.NewDocument(template, 0, 0, 0)
-            
+
             if doc is None:
                 return self._result(False, "Failed to create assembly",
                                   SwErrors.swFileLoadError)
@@ -130,12 +142,20 @@ class DocumentOperations:
                 if not r["success"]:
                     return r
             
-            template = find_template("drawing")
+            template = self._get_template("drawing")
             if not template:
-                template = ""
-            
+                return self._result(False,
+                    "No drawing template found (disk search and the "
+                    "running app's own default template preference both "
+                    "came up empty -- common if SW was never pointed at a "
+                    "drawing template/sheet format). Set "
+                    "exe_path/drawing_template in config, or set a "
+                    "default drawing template in SW's own "
+                    "Options > Default Templates.",
+                    SwErrors.swTemplateNotFound)
+
             doc = self._sw_app.NewDocument(template, 0, 0, 0)
-            
+
             if doc is None:
                 return self._result(False, "Failed to create drawing",
                                   SwErrors.swFileLoadError)
