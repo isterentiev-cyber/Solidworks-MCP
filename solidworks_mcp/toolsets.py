@@ -90,6 +90,9 @@ TOOLSETS: Dict[str, Set[str]] = {
         "mirror_features",
         "delete_feature",
         "suppress_feature",
+        "edit_feature",
+        "create_reference_plane",
+        "create_reference_axis",
     },
     # Reading the model back: topology, tree, parameters and equations.
     "analysis": {
@@ -98,6 +101,8 @@ TOOLSETS: Dict[str, Set[str]] = {
         "get_parameters",
         "set_parameter",
         "add_parameter",
+        "mass_properties",
+        "get_rebuild_errors",
     },
 }
 

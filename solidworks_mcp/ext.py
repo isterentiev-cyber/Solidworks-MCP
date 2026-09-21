@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 import pythoncom
 import win32com.client
 
-from .utils.typelib import get_sw_module, get_constant
+from .utils.typelib import get_sw_module, get_constant, get_const_module
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +233,33 @@ def snapshot(app) -> Optional[Dict]:
         return None
 
 
+_FEATURE_ERROR_NAMES: Optional[Dict[int, str]] = None
+
+
+def feature_error_name(code) -> str:
+    """'FilletRadiusTooBig2' for 19, built from swFeatureError* in the
+    constants typelib. A bare 'code 19' tells the model nothing; the name is
+    usually the whole diagnosis. Falls back to the number if the typelib is
+    unavailable."""
+    global _FEATURE_ERROR_NAMES
+    if _FEATURE_ERROR_NAMES is None:
+        table: Dict[int, str] = {}
+        try:
+            consts = get_const_module().constants
+            prefix = "swFeatureError"
+            for n in dir(consts):
+                if not n.startswith(prefix):
+                    continue
+                val = getattr(consts, n)
+                if isinstance(val, int):
+                    table.setdefault(val, n[len(prefix):])
+        except Exception:
+            pass
+        _FEATURE_ERROR_NAMES = table
+    name = _FEATURE_ERROR_NAMES.get(int(code))
+    return f"{name} ({code})" if name else f"code {code}"
+
+
 def feature_errors(md, names: List[str]) -> List[str]:
     out = []
     for n in names:
@@ -240,7 +267,8 @@ def feature_errors(md, names: List[str]) -> List[str]:
             r = find_feature(md, n).GetErrorCode2()
             code, warn = (r if isinstance(r, tuple) else (r, False))
             if code:
-                out.append(f"{'warning' if warn else 'ERROR'} in {n}: code {code}")
+                out.append(f"{'warning' if warn else 'ERROR'} in {n}: "
+                           f"{feature_error_name(code)}")
         except Exception:
             pass
     return out
@@ -1277,6 +1305,353 @@ def t_transaction(app, args):
     return _ok(f"abort '{tx['name']}': rolled back" + (f", STILL PRESENT: {left}" if left else ""))
 
 
+# ============================================================================
+# Stage 1: reference geometry, mass, rebuild errors, feature editing
+# ============================================================================
+
+# swRefPlaneReferenceConstraint_* -- verified against swconst.tlb through
+# scripts/swapi.py find swRefPlaneReferenceConstraint, not from memory.
+_PLANE_CONSTRAINT = {
+    "distance": 8,
+    "angle": 16,
+    "coincident": 4,
+    "parallel": 1,
+    "perpendicular": 2,
+    "tangent": 32,
+    "midplane": 128,
+}
+_PLANE_FLIP = 256
+
+
+def select_geom(md, spec: str, append: bool = False, mark: int = 0):
+    """Select one reference for the reference-geometry tools.
+
+    Accepts 'front'/'top'/'right' (locale-independent, resolved through the
+    first three RefPlane features), 'face:3' / 'edge:7' (indices from
+    list_faces / list_edges), or any feature name as shown by inspect.
+    """
+    spec = str(spec).strip()
+    if ":" in spec:
+        kind, idx = spec.split(":", 1)
+        select_entities(md, kind.strip().lower(), idx, append=append, mark=mark)
+        return spec
+    name = resolve_plane(md, spec)
+    if not find_feature(md, name).Select2(append, mark):
+        raise ExtError(f"Could not select '{spec}'")
+    return name
+
+
+def _tree_names(md):
+    return [f.Name for f in iter_features(md)]
+
+
+def _new_feature(md, before_names):
+    """The feature that appeared since before_names was taken, if any."""
+    new = [n for n in _tree_names(md) if n not in before_names]
+    if not new:
+        return None
+    return find_feature(md, new[-1])
+
+
+def t_create_reference_plane(app, args):
+    """Reference plane from one or two references.
+
+    This is the documented way around the sketch-on-cylindrical-face dead end
+    (NOTES.md): an offset plane works where InsertSketch2 on a curved face
+    does not.
+    """
+    md = model(app)
+    kind = (args.get("kind") or "distance").strip().lower()
+    if kind not in _PLANE_CONSTRAINT:
+        raise ExtError(f"kind must be one of {', '.join(sorted(_PLANE_CONSTRAINT))}")
+
+    value = args.get("value")
+    if kind in ("distance", "angle") and value is None:
+        raise ExtError(f"kind '{kind}' needs a value (mm for distance, deg for angle)")
+
+    constraint = _PLANE_CONSTRAINT[kind]
+    if args.get("reverse"):
+        constraint |= _PLANE_FLIP
+
+    if kind == "angle":
+        sysval = math.radians(float(value))
+    elif value is None:
+        sysval = 0.0
+    else:
+        sysval = float(value) / 1000.0
+
+    before_names = _tree_names(md)
+    md.ClearSelection2(True)
+    refs = [select_geom(md, args["reference"], append=False, mark=0)]
+    second = args.get("second_reference")
+    if second:
+        refs.append(select_geom(md, second, append=True, mark=0))
+
+    fm = T(md.FeatureManager, "IFeatureManager")
+    fm.InsertRefPlane(constraint, sysval, 0, 0, 0, 0)
+    md.ClearSelection2(True)
+
+    # InsertRefPlane does not reliably hand back the feature (NOTES.md,
+    # typed-wrapper gotchas), so the tree is the source of truth regardless.
+    made = _new_feature(md, before_names)
+    if made is None:
+        raise ExtError(
+            f"No plane created from {refs} ({kind}={value}). "
+            f"distance/angle take ONE parallel reference; coincident and "
+            f"perpendicular usually need a second one (second_reference)."
+        )
+    if args.get("name"):
+        made.Name = args["name"]
+    unit = "deg" if kind == "angle" else "mm"
+    txt = f"{made.Name}: {kind}"
+    if value is not None:
+        txt += f" {fnum(float(value), 3)} {unit}"
+    txt += f" from {', '.join(refs)}"
+    if args.get("reverse"):
+        txt += " (flipped)"
+    return _ok(txt)
+
+
+def t_create_reference_axis(app, args):
+    """Reference axis from two planes/points, one cylindrical face, or a line."""
+    md = model(app)
+    before_names = _tree_names(md)
+    md.ClearSelection2(True)
+    refs = []
+    for n, spec in enumerate(parse_names(args["references"])):
+        refs.append(select_geom(md, spec, append=n > 0, mark=0))
+    if not refs:
+        raise ExtError("references is empty")
+
+    if not md.InsertAxis2(True):
+        md.ClearSelection2(True)
+        raise ExtError(
+            f"InsertAxis2 failed for {refs}. Two intersecting planes, two "
+            f"points, a cylindrical face or a line are valid; two PARALLEL "
+            f"planes are not."
+        )
+    md.ClearSelection2(True)
+    made = _new_feature(md, before_names)
+    if made is None:
+        raise ExtError(f"No axis appeared in the tree for {refs}")
+    if args.get("name"):
+        made.Name = args["name"]
+    if args.get("hide"):
+        md.ClearSelection2(True)
+        made.Select2(False, 0)
+        md.BlankRefGeom()
+        md.ClearSelection2(True)
+    return _ok(f"{made.Name}: axis from {', '.join(refs)}")
+
+
+def _mass_property(md):
+    """IMassProperty2 if this install has it, else IMassProperty.
+
+    UseSystemUnits pins the readings to SI no matter how the document is
+    configured, so the conversions below start from a known base instead of
+    from whatever units the user last picked.
+    """
+    ext_obj = md.Extension
+    for factory, iface in (("CreateMassProperty2", "IMassProperty2"),
+                           ("CreateMassProperty", "IMassProperty")):
+        try:
+            raw = v(ext_obj, factory)
+        except Exception:
+            continue
+        if raw is not None:
+            mp = T(raw, iface)
+            try:
+                mp.UseSystemUnits = True
+            except Exception:
+                pass
+            return mp, iface
+    raise ExtError("Could not create a mass property object for this document")
+
+
+def t_mass_properties(app, args):
+    md = model(app)
+    bs = bodies(md)
+    if not bs:
+        raise ExtError("No solid bodies in the active document")
+    mp, iface = _mass_property(md)
+    try:
+        mp.Recalculate()
+    except Exception:
+        pass
+
+    mass_kg = float(mp.Mass)
+    vol_mm3 = float(mp.Volume) * 1e9
+    area_mm2 = float(mp.SurfaceArea) * 1e6
+    density = float(mp.Density)                       # kg/m3
+    com_m = list(mp.CenterOfMass or (0.0, 0.0, 0.0))  # metres
+    com_mm = [c * 1000.0 for c in com_m]
+
+    grams = mass_kg * 1000.0
+    mass_txt = f"{fnum(grams, 2)} g" if grams < 1000 else f"{fnum(mass_kg, 4)} kg"
+    lines = [
+        f"mass {mass_txt} | volume {fnum(vol_mm3, 1)} mm3 | "
+        f"area {fnum(area_mm2, 1)} mm2 | density {fnum(density / 1000.0, 4)} g/cm3",
+        f"center of mass (mm): {fpt(com_m)}",
+    ]
+
+    data = {
+        "mass_kg": mass_kg,
+        "volume_mm3": vol_mm3,
+        "surface_area_mm2": area_mm2,
+        "density_kg_m3": density,
+        "center_of_mass_mm": com_mm,
+        "bodies": len(bs),
+        "interface": iface,
+    }
+
+    try:
+        pm = mp.PrincipalMomentsOfInertia
+        if pm:
+            data["principal_moments_kg_m2"] = list(pm)
+            lines.append("principal moments (kg*m2): "
+                         + ", ".join(fnum(x, 6) for x in pm))
+    except Exception:
+        pass
+
+    if len(bs) > 1:
+        lines.append(f"({len(bs)} bodies -- values cover all of them)")
+    return _ok("\n".join(lines), data)
+
+
+def t_get_rebuild_errors(app, args):
+    """What is broken in the active document.
+
+    Built on IFeature.GetErrorCode2, which this codebase already relies on,
+    rather than on IModelDocExtension.GetWhatsWrong: the latter returns three
+    by-ref arrays and is exactly the kind of call that hands back nothing
+    without saying so. GetWhatsWrong is used to enrich, never to decide.
+    """
+    md = model(app)
+    feats = list(user_features(md))
+
+    errors, warnings = [], []
+    for f in feats:
+        try:
+            r = f.GetErrorCode2()
+        except Exception:
+            continue
+        code, is_warn = (r if isinstance(r, tuple) else (r, False))
+        if not code:
+            continue
+        entry = f"{f.Name} ({v(f, 'GetTypeName2')}): {feature_error_name(code)}"
+        (warnings if is_warn else errors).append(entry)
+
+    bad_sketches = []
+    for f in feats:
+        if v(f, "GetTypeName2") != "ProfileFeature":
+            continue
+        try:
+            st = sketch_status(f.GetSpecificFeature2())
+        except Exception:
+            continue
+        if st != 3:
+            bad_sketches.append(f"{f.Name} is {_STATUS.get(st, st)}")
+
+    whats_wrong = None
+    try:
+        n = v(md.Extension, "GetWhatsWrongCount")
+        if n:
+            whats_wrong = int(n)
+    except Exception:
+        pass
+
+    parts = []
+    if errors:
+        parts.append(f"ERRORS ({len(errors)}):\n  " + "\n  ".join(errors))
+    if warnings:
+        parts.append(f"warnings ({len(warnings)}):\n  " + "\n  ".join(warnings))
+    if bad_sketches:
+        parts.append(f"sketches not fully defined ({len(bad_sketches)}):\n  "
+                     + "\n  ".join(bad_sketches))
+
+    if not parts:
+        msg = (f"clean: {len(feats)} features, no rebuild errors, "
+               f"every sketch fully defined")
+        if whats_wrong:
+            msg += (f" -- but SW reports GetWhatsWrongCount={whats_wrong}, "
+                    f"so rebuild and re-check")
+        return _ok(msg)
+
+    if whats_wrong is not None:
+        parts.append(f"SW GetWhatsWrongCount = {whats_wrong}")
+    return _ok("\n".join(parts), {
+        "errors": errors,
+        "warnings": warnings,
+        "sketches_not_fully_defined": bad_sketches,
+    })
+
+
+def _parse_assignments(spec):
+    """'D1=25, D2=10' -> [('D1', 25.0), ('D2', 10.0)]. A dict also works."""
+    if isinstance(spec, dict):
+        return [(str(k), float(val)) for k, val in spec.items()]
+    out = []
+    for chunk in str(spec).replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ExtError(f"'{chunk}' is not name=value")
+        k, val = chunk.split("=", 1)
+        try:
+            out.append((k.strip(), float(val.strip().replace(",", "."))))
+        except ValueError:
+            raise ExtError(f"'{val.strip()}' is not a number (in '{chunk}')")
+    if not out:
+        raise ExtError("dimensions is empty")
+    return out
+
+
+def t_edit_feature(app, args):
+    """Change dimensions of an existing feature in place, by short name.
+
+    set_parameter already sets a dimension given its FULL name
+    ('D1@Sketch1'). This exists because the short name is what you actually
+    see, and because editing several dimensions of one feature should cost
+    one rebuild instead of N.
+    """
+    md = model(app)
+    fname = args["feature"]
+    feat = find_feature(md, fname)
+    wanted = _parse_assignments(args["dimensions"])
+    all_cfg = get_constant("swAllConfiguration")
+
+    found = {}
+    for dd in display_dims(feat):
+        dim = T(dd.GetDimension2(0), "IDimension")
+        found[dim.Name] = dim
+        found[dim.FullName] = dim
+
+    missing = [k for k, _ in wanted if k not in found]
+    if missing:
+        names = sorted({d.Name for d in found.values()})
+        raise ExtError(f"{fname} has no dimension(s) {missing}. "
+                       f"It has: {names or 'none'} "
+                       f"(get_parameters shows their values)")
+
+    before = snapshot(app)
+    applied = []
+    for key, num in wanted:
+        dim = found[key]
+        is_angle = dim.GetType() == 1
+        dim.SetSystemValue3(math.radians(num) if is_angle else num / 1000.0,
+                            all_cfg, None)
+        applied.append(f"{dim.Name}={fnum(num, 4)}" + ("deg" if is_angle else ""))
+
+    md.EditRebuild3()
+    errs = feature_errors(md, [f.Name for f in user_features(md)])
+    msg = (f"{fname}: " + ", ".join(applied) + " | "
+           + delta(app, before, snapshot(app)))
+    if errs:
+        msg += "\nWARNING " + "; ".join(errs)
+    return _ok(msg)
+
+
 HANDLERS = {
     "inspect": t_inspect,
     "list_faces": t_list_faces,
@@ -1295,6 +1670,11 @@ HANDLERS = {
     "delete_feature": t_delete_feature,
     "suppress_feature": t_suppress_feature,
     "transaction": t_transaction,
+    "create_reference_plane": t_create_reference_plane,
+    "create_reference_axis": t_create_reference_axis,
+    "mass_properties": t_mass_properties,
+    "get_rebuild_errors": t_get_rebuild_errors,
+    "edit_feature": t_edit_feature,
     "sketch_entities": t_sketch_entities,
     "add_sketch_relation": t_add_sketch_relation,
     "add_sketch_dimension": t_add_sketch_dimension,
@@ -1464,6 +1844,45 @@ TOOL_SCHEMAS = [
            "value": {"type": "number", "description": "mm or deg; omit to keep the drawn value"},
            "link": {"type": "string", "description": "Global variable name to drive this dimension"},
            "x": {"type": "number"}, "y": {"type": "number"}}, ["entities"])),
+    ("create_reference_plane",
+     "Create a reference plane. kind=distance (default) offsets a parallel plane by value mm -- "
+     "this is the working way around the sketch-on-cylindrical-face dead end. Other kinds: angle "
+     "(value in deg, needs an axis/edge as second_reference), coincident, parallel, perpendicular, "
+     "tangent, midplane. Reference: 'front'/'top'/'right', a feature name, or 'face:N'/'edge:N' "
+     "from list_faces/list_edges.",
+     _obj({"reference": {"type": "string", "description": "'front'/'top'/'right', feature name, or 'face:N'/'edge:N'"},
+           "kind": {"type": "string",
+                    "enum": ["distance", "angle", "coincident", "parallel",
+                             "perpendicular", "tangent", "midplane"],
+                    "default": "distance"},
+           "value": {"type": "number", "description": "mm for distance, deg for angle"},
+           "second_reference": {"type": "string", "description": "Second reference, when the kind needs one"},
+           "reverse": {"type": "boolean", "default": False, "description": "Flip to the other side"},
+           "name": {"type": "string", "description": "Rename the new plane"}},
+          ["reference"])),
+    ("create_reference_axis",
+     "Create a reference axis from two intersecting planes, two points, one cylindrical face, or a "
+     "line. Two PARALLEL planes do not define an axis and are rejected. References are comma-"
+     "separated: 'front,right' or 'face:2'.",
+     _obj({"references": {"type": "string", "description": "e.g. 'front,right' or 'face:2'"},
+           "name": {"type": "string", "description": "Rename the new axis"},
+           "hide": {"type": "boolean", "default": False, "description": "Hide it after creation"}},
+          ["references"])),
+    ("mass_properties",
+     "Mass, volume, surface area, density, centre of mass and principal moments of the active part. "
+     "Read in SI and reported in g/kg, mm3, mm2, g/cm3 and mm regardless of the document's own units.",
+     _obj({})),
+    ("get_rebuild_errors",
+     "What is broken in the active document: features with rebuild errors or warnings, and sketches "
+     "that are not fully defined. Run after a failed build, or before trusting a model.",
+     _obj({})),
+    ("edit_feature",
+     "Change dimensions of an existing feature in place, by their SHORT names (D1, D2 -- as shown by "
+     "get_parameters), without rebuilding the model from scratch. Several dimensions cost one "
+     "rebuild. Reports the volume/topology delta and any rebuild errors afterwards.",
+     _obj({"feature": {"type": "string", "description": "Feature name, e.g. 'Boss-Extrude1'"},
+           "dimensions": {"type": "string", "description": "e.g. 'D1=25, D2=10' (mm, or deg for angles)"}},
+          ["feature", "dimensions"])),
     ("reload_api",
      "Hot-reload the server's Python code (automation/*, ext.py) from disk after editing it. "
      "Keeps the SolidWorks connection. New/changed tool SCHEMAS still need an MCP restart.",

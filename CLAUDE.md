@@ -65,6 +65,24 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
   [NOTES.md § Определённость эскизов](NOTES.md#определённость-эскизов-sketch_entities--add_sketch_relation--add_sketch_dimension).
 - **Нативные фичи, а не эмуляция**: фаска — `chamfer_edges`, не
   вырез вращением; отверстие — `hole`, не вырез окружности.
+- **Справочная геометрия**: `create_reference_plane` (kind=distance —
+  смещённая плоскость, рабочий обход тупика со скетчем на цилиндрической
+  грани; ещё angle/coincident/parallel/perpendicular/tangent/midplane) и
+  `create_reference_axis`. Ссылки: `front`/`top`/`right`, имя фичи или
+  `face:N`/`edge:N`.
+- **Масса и центр тяжести**: `mass_properties` — масса, объём, площадь,
+  плотность, ЦТ, главные моменты. Всегда в г/кг, мм³, мм², г/см³ и мм,
+  независимо от единиц документа.
+- **Что сломано**: `get_rebuild_errors` — фичи с ошибками (коды переведены
+  в имена: `FilletRadiusTooBig2 (19)`, а не `code 19`) и эскизы, не
+  доведённые до fully defined. Запускать после неудачной сборки и перед
+  тем, как поверить модели.
+- **Правка готовой фичи**: `edit_feature(feature, "D1=30, D2=10")` — по
+  коротким именам, все размеры за одно перестроение. Для полного имени
+  (`D1@Sketch1`) уже есть `set_parameter`, список размеров — в
+  `get_parameters(feature=...)`; отдельных `set_dimension`/`list_dimensions`
+  не заводить. Правка *определения* фичи (граничное условие, направление)
+  не покрыта.
 - **Отверстия / массивы / параметры / транзакции**: `hole` (Hole Wizard:
   drill/tap/cbore, несколько точек), `circular_pattern`, `linear_pattern`,
   `mirror_features`, `get/set/add_parameter`, `delete_feature`,
