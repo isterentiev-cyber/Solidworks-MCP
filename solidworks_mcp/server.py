@@ -19,6 +19,7 @@ Fixes v4.0.0:
 import io
 import sys
 import json
+import importlib
 import logging
 import traceback
 from typing import Dict
@@ -34,6 +35,7 @@ from .automation import SolidWorksAutomation
 from .constants import SwErrors
 from .config import get_config, save_config
 from .utils import get_solidworks_info, set_default_unit, com_get, get_signature, get_constant
+from . import ext
 
 # Configure logging
 config = get_config()
@@ -61,7 +63,7 @@ server = Server("solidworks-mcp-server")
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List all available SolidWorks tools"""
-    return [
+    base = [
         # Connection Tools
         Tool(
             name="connect_solidworks",
@@ -157,7 +159,10 @@ async def list_tools() -> list[Tool]:
         # Sketch Tools
         Tool(
             name="create_sketch",
-            description="Create a new sketch on a plane.",
+            description=(
+                "Create a new sketch on a default plane (optionally on a parallel plane at `offset`). "
+                "The result reports the sketch frame: where sketch X/Y point in model space."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -166,17 +171,23 @@ async def list_tools() -> list[Tool]:
                         "enum": ["Front", "Top", "Right"],
                         "default": "Front",
                         "description": "Plane to sketch on"
-                    }
+                    },
+                    "offset": {"type": "number", "default": 0, "description": "Offset along the plane normal (creates a reference plane); negative = other side"},
+                    "unit": {"type": "string", "description": "Unit for offset"}
                 },
                 "required": []
             }
         ),
         Tool(
             name="create_sketch_on_face",
-            description="Create a new sketch on an existing body face (by 3D coordinates). Use for cut-extrude on faces instead of reference planes.",
+            description=(
+                "Create a new sketch on a planar body face, by face_index (from list_faces) or by a 3D point on it. "
+                "Sketch coordinates are LOCAL to the face -- read the reported sketch frame before drawing."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "face_index": {"type": "integer", "default": 0, "description": "Face index from list_faces (overrides x/y/z)"},
                     "x": {"type": "number", "default": 0, "description": "X coordinate on the face"},
                     "y": {"type": "number", "default": 0, "description": "Y coordinate on the face"},
                     "z": {"type": "number", "default": 0, "description": "Z coordinate on the face"},
@@ -187,10 +198,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="draw_line",
-            description="Draw a line in the active sketch.",
+            description="Draw a line in the active sketch (construction=true -> centerline, e.g. revolve axis).",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "construction": {"type": "boolean", "default": False, "description": "Centerline instead of a profile line"},
                     "x1": {"type": "number", "default": 0, "description": "Start X"},
                     "y1": {"type": "number", "default": 0, "description": "Start Y"},
                     "x2": {"type": "number", "default": 100, "description": "End X"},
@@ -270,6 +282,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "depth": {"type": "number", "default": 10, "description": "Extrusion depth"},
                     "both_directions": {"type": "boolean", "default": False, "description": "Extrude in both directions"},
+                    "reverse": {"type": "boolean", "default": False, "description": "Extrude opposite to the sketch normal"},
                     "unit": {"type": "string", "description": "Unit"}
                 },
                 "required": []
@@ -278,28 +291,31 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="revolve_sketch",
             description=(
-                "Revolve the active sketch around its centerline (Boss/Cut-Revolve). "
-                "The sketch must contain exactly one centerline as the axis, plus a "
-                "closed profile on one side of it."
+                "Revolve the active sketch (Boss/Cut-Revolve) around its single centerline, "
+                "or around `axis` (world X/Y/Z, axis feature, edge) -- then no centerline is needed. "
+                "Profile must be closed and on one side of the axis."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "angle": {"type": "number", "default": 360, "description": "Revolve angle in degrees"},
-                    "cut": {"type": "boolean", "default": False, "description": "Cut-revolve instead of boss-revolve"}
+                    "cut": {"type": "boolean", "default": False, "description": "Cut-revolve instead of boss-revolve"},
+                    "reverse": {"type": "boolean", "default": False, "description": "Revolve the other way (for angles < 360)"},
+                    "axis": {"type": "string", "description": "Axis outside the sketch instead of a centerline: 'X'/'Y'/'Z' (world, through origin), 'edge:N', or an axis feature name"}
                 },
                 "required": []
             }
         ),
         Tool(
             name="cut_extrude",
-            description="Cut extrude to remove material.",
+            description="Cut extrude to remove material. Direction is verified by volume and retried the other way if nothing was removed.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "depth": {"type": "number", "default": 10, "description": "Cut depth"},
                     "through_all": {"type": "boolean", "default": False, "description": "Cut through all"},
                     "both_directions": {"type": "boolean", "default": False, "description": "Cut both directions"},
+                    "reverse": {"type": "boolean", "default": False, "description": "Try the opposite direction first"},
                     "unit": {"type": "string", "description": "Unit"}
                 },
                 "required": []
@@ -307,10 +323,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="fillet_edges",
-            description="Add fillet to selected edges.",
+            description="Add fillet to edges (edge_indices from list_edges, or the current selection).",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "edge_indices": {"type": "string", "description": "e.g. '1,2,5' (from list_edges); omit to use current selection"},
                     "radius": {"type": "number", "default": 2, "description": "Fillet radius"},
                     "unit": {"type": "string", "description": "Unit"}
                 },
@@ -319,10 +336,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="chamfer_edges",
-            description="Add chamfer to selected edges.",
+            description="Add chamfer (distance x angle) to edges (edge_indices from list_edges, or the current selection).",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "edge_indices": {"type": "string", "description": "e.g. '1,2,5' (from list_edges); omit to use current selection"},
                     "distance": {"type": "number", "default": 2, "description": "Chamfer distance"},
                     "angle": {"type": "number", "default": 45, "description": "Chamfer angle (degrees)"},
                     "unit": {"type": "string", "description": "Unit"}
@@ -366,7 +384,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="execute_python",
-            description="Execute custom Python code with stdout capture. Access 'sw' (app), 'doc' (active document). Use print() for debug output.",
+            description=(
+                "Execute Python against the live SolidWorks connection; print() your results. "
+                "Pre-bound (fresh each call): sw (app), doc (ActiveDoc, dynamic), md (typed IModelDoc2), "
+                "T(obj,'IFace2') typed wrapper, v(obj,'Member') call-or-read, ext (helpers: face_rows, "
+                "edge_rows, select_entities, find_feature, snapshot, delta...), g (com_get), math, json. "
+                "Variables you assign persist between calls. SW API units are metres/radians."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -406,6 +430,7 @@ async def list_tools() -> list[Tool]:
             }
         ),
     ]
+    return base + [Tool(name=n, description=d, inputSchema=s) for n, d, s in ext.TOOL_SCHEMAS]
 
 
 # ============================================================================
@@ -414,16 +439,15 @@ async def list_tools() -> list[Tool]:
 
 def format_result(r: Dict) -> str:
     """Format result dictionary as readable text"""
-    status = "SUCCESS" if r["success"] else "ERROR"
-    lines = [f"[{status}] {r['message']}"]
-    
-    if not r["success"]:
-        lines.append(f"Error Code: {r['error_code']} ({r['error_name']})")
-    
-    if r.get("data"):
-        lines.append("Details: " + json.dumps(r["data"], indent=2))
-    
-    return "\n".join(lines)
+    # Compact on purpose: this is read by a model, and the upstream
+    # indent=2 JSON dump often repeated the message (execute_python
+    # printed its whole stdout twice).
+    status = "OK" if r["success"] else "ERROR"
+    text = f"[{status}] {r['message']}"
+    data = r.get("data")
+    if data and not r.get("_no_data"):
+        text += "\n" + json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+    return text
 
 
 # ============================================================================
@@ -435,7 +459,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle MCP tool calls"""
     try:
         logger.info(f"Tool: {name}, Args: {arguments}")
-        
+        arguments = arguments or {}
+
+        # Feature tools get a volume/topology delta appended (ext.delta),
+        # so every step is self-verifying without extra inspect calls.
+        before = None
+        if name in ext.REPORTED and sw_automation.is_connected:
+            before = ext.snapshot(sw_automation.app)
+            if name in ("fillet_edges", "chamfer_edges") and arguments.get("edge_indices"):
+                ext.select_entities(ext.model(sw_automation.app), "edge",
+                                    arguments["edge_indices"], mark=1)
+
         # Connection Tools
         if name == "connect_solidworks":
             result = sw_automation.connect()
@@ -483,23 +517,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         # Sketch Tools
         elif name == "create_sketch":
-            result = sw_automation.create_sketch(arguments.get("plane", "Front"))
-        
+            result = sw_automation.create_sketch(
+                arguments.get("plane", "Front"),
+                arguments.get("offset", 0),
+                arguments.get("unit")
+            )
+
         elif name == "create_sketch_on_face":
             result = sw_automation.create_sketch_on_face(
                 arguments.get("x", 0),
                 arguments.get("y", 0),
                 arguments.get("z", 0),
-                arguments.get("unit")
+                arguments.get("unit"),
+                arguments.get("face_index", 0)
             )
-        
+
         elif name == "draw_line":
             result = sw_automation.draw_line(
                 arguments.get("x1", 0),
                 arguments.get("y1", 0),
                 arguments.get("x2", 100),
                 arguments.get("y2", 0),
-                arguments.get("unit")
+                arguments.get("unit"),
+                arguments.get("construction", False)
             )
         
         elif name == "draw_circle":
@@ -543,13 +583,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = sw_automation.extrude_sketch(
                 arguments.get("depth", 10),
                 arguments.get("both_directions", False),
-                arguments.get("unit")
+                arguments.get("unit"),
+                arguments.get("reverse", False)
             )
         
         elif name == "revolve_sketch":
             result = sw_automation.revolve_sketch(
                 arguments.get("angle", 360),
-                arguments.get("cut", False)
+                arguments.get("cut", False),
+                arguments.get("reverse", False),
+                arguments.get("axis")
             )
 
         elif name == "cut_extrude":
@@ -557,7 +600,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 arguments.get("depth", 10),
                 arguments.get("through_all", False),
                 arguments.get("both_directions", False),
-                arguments.get("unit")
+                arguments.get("unit"),
+                arguments.get("reverse", False)
             )
         
         elif name == "fillet_edges":
@@ -611,9 +655,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "lookup_api_constant":
             result = _lookup_api_constant_handler(arguments.get("name", ""))
 
+        elif name == "reload_api":
+            result = _reload_api()
+
+        elif name in ext.HANDLERS:
+            result = ext.dispatch(name, arguments, sw_automation)
+
         else:
             result = sw_automation._result(False, f"Unknown tool: {name}", SwErrors.swUnknownError)
-        
+
+        if before is not None and result.get("success"):
+            d = ext.delta(sw_automation.app, before, ext.snapshot(sw_automation.app),
+                          ext.expect_for(name, arguments))
+            if d:
+                result["message"] += " | " + d
+            result.pop("data", None)
+
         logger.info(f"Result: success={result['success']}")
         return [TextContent(type="text", text=format_result(result))]
         
@@ -626,114 +683,110 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # FIXED: Execute Python with stdout capture
 # ============================================================================
 
+# One namespace for the whole server process: variables assigned in one
+# execute_python call are visible in the next (like a REPL).
+_PY_NS: Dict = {}
+
+
 def _execute_python_fixed(code: str) -> Dict:
     """
-    Execute custom Python code with access to SolidWorks.
-    FIXED: Now captures stdout, stderr, and 'result' variable.
+    Execute Python against the live SolidWorks connection.
+    stdout/stderr are captured and returned even when the code raises --
+    the upstream version dropped everything printed before the error.
     """
+    if not sw_automation.is_connected:
+        r = sw_automation.connect()
+        if not r["success"]:
+            return r
+
+    import math
+    import os as os_module
+    import win32com.client
+    import pythoncom
+
+    app = sw_automation.app
+    doc = app.ActiveDoc if app else None
+    _PY_NS.update({
+        "sw": app,
+        "doc": doc,
+        "md": ext.T(doc, "IModelDoc2") if doc is not None else None,
+        "T": ext.T,
+        "v": ext.v,
+        "ext": ext,
+        "g": com_get,
+        "automation": sw_automation,
+        "win32com": win32com,
+        "pythoncom": pythoncom,
+        "math": math,
+        "os": os_module,
+        "json": json,
+        "result": None,
+    })
+
+    out, errs = io.StringIO(), io.StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+    failure = None
     try:
-        if not sw_automation.is_connected:
-            r = sw_automation.connect()
-            if not r["success"]:
-                return r
-        
-        import win32com.client
-        import pythoncom
-        import math
-        import os as os_module
-        
-        # Prepare execution context with many useful objects
-        exec_globals = {
-            # SolidWorks objects
-            'sw': sw_automation.app,
-            'doc': sw_automation.app.ActiveDoc if sw_automation.app else None,
-            'automation': sw_automation,
-            
-            # COM libraries
-            'win32com': win32com,
-            'pythoncom': pythoncom,
-            
-            # Standard libraries
-            'math': math,
-            'os': os_module,
-            'json': json,
-            
-            # Result placeholder
-            'result': None,
-        }
-        
-        # Capture stdout and stderr
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        captured_stdout = io.StringIO()
-        captured_stderr = io.StringIO()
-        
-        try:
-            sys.stdout = captured_stdout
-            sys.stderr = captured_stderr
-            
-            # Execute the code
-            exec(code, exec_globals)
-            
-        finally:
-            # Always restore stdout/stderr
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-        
-        # Get captured output
-        stdout_text = captured_stdout.getvalue()
-        stderr_text = captured_stderr.getvalue()
-        result_val = exec_globals.get('result')
-        
-        # Build response message
-        message_parts = []
-        
-        if stdout_text:
-            message_parts.append(f"=== Output ===\n{stdout_text.rstrip()}")
-        
-        if stderr_text:
-            message_parts.append(f"=== Stderr ===\n{stderr_text.rstrip()}")
-        
-        if result_val is not None:
-            message_parts.append(f"=== Result ===\n{result_val}")
-        
-        if not message_parts:
-            message_parts.append("Code executed successfully (no output)")
-        
-        return {
-            "success": True,
-            "message": "\n\n".join(message_parts),
-            "error_code": 0,
-            "error_name": "swSuccess",
-            "data": {
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "result": str(result_val) if result_val is not None else None
-            }
-        }
-        
-    except SyntaxError as e:
-        return {
-            "success": False,
-            "message": f"Syntax error: {e}",
-            "error_code": 999,
-            "error_name": "swUnknownError",
-            "data": {"error_type": "SyntaxError", "details": str(e)}
-        }
-        
+        sys.stdout, sys.stderr = out, errs
+        exec(code, _PY_NS)
+    except Exception:
+        failure = traceback.format_exc(limit=-3)
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+
+    parts = []
+    if out.getvalue():
+        parts.append(out.getvalue().rstrip())
+    if errs.getvalue():
+        parts.append("[stderr] " + errs.getvalue().rstrip())
+    if _PY_NS.get("result") is not None:
+        parts.append(f"[result] {_PY_NS['result']}")
+    if failure:
+        parts.append("[exception]\n" + failure.rstrip())
+    msg = "\n".join(parts) or "(no output)"
+    return {
+        "success": failure is None,
+        "message": msg,
+        "error_code": 0 if failure is None else 999,
+        "error_name": "swSuccess" if failure is None else "swUnknownError",
+    }
+
+
+# ============================================================================
+# reload_api: hot-reload automation mixins + ext without restarting
+# ============================================================================
+
+_RELOAD_ORDER = [
+    "solidworks_mcp.utils.com_helpers",
+    "solidworks_mcp.ext",
+    "solidworks_mcp.automation.base",
+    "solidworks_mcp.automation.documents",
+    "solidworks_mcp.automation.sketches",
+    "solidworks_mcp.automation.features",
+    "solidworks_mcp.automation.capture",
+    "solidworks_mcp.automation",
+]
+
+
+def _reload_api() -> Dict:
+    """Reload modules in dependency order, then swap the live automation
+    instance onto the fresh class -- the COM connection (instance state)
+    survives. server.py itself is not reloaded (tool schemas are fixed at
+    MCP startup anyway)."""
+    done = []
+    try:
+        for name in _RELOAD_ORDER:
+            mod = sys.modules.get(name)
+            if mod is not None:
+                importlib.reload(mod)
+                done.append(name.rsplit(".", 1)[-1])
+        sw_automation.__class__ = sys.modules["solidworks_mcp.automation"].SolidWorksAutomation
+        return {"success": True, "message": "reloaded: " + ", ".join(done),
+                "error_code": 0, "error_name": "swSuccess"}
     except Exception as e:
-        tb = traceback.format_exc()
-        return {
-            "success": False,
-            "message": f"Execution error: {e}\n\nTraceback:\n{tb}",
-            "error_code": 999,
-            "error_name": "swUnknownError",
-            "data": {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "traceback": tb
-            }
-        }
+        return {"success": False,
+                "message": f"reload failed after {done}: {e}\n{traceback.format_exc(limit=-3)}",
+                "error_code": 999, "error_name": "swUnknownError"}
 
 
 # ============================================================================
@@ -975,26 +1028,18 @@ def _get_sketch_status_handler() -> Dict:
         except:
             pass
         
-        # Walk feature tree (using PROPERTIES not methods)
+        # Walk feature tree through typed wrappers (ext) -- the old
+        # property-style walk broke once the doc came back makepy-typed.
         try:
-            feat = doc.FirstFeature
-            while feat is not None:
-                try:
-                    feat_type = feat.GetTypeName2
-                    info["feature_count"] += 1
-                    
-                    if feat_type == "ProfileFeature":
-                        info["sketch_count"] += 1
-                        info["sketch_names"].append(feat.Name)
-                    elif feat_type == "Extrusion":
-                        info["extrusion_count"] += 1
-                except:
-                    pass
-                try:
-                    feat = feat.GetNextFeature
-                except:
-                    break
-        except:
+            for f in ext.user_features(ext.T(doc, "IModelDoc2")):
+                feat_type = ext.v(f, "GetTypeName2")
+                info["feature_count"] += 1
+                if feat_type == "ProfileFeature":
+                    info["sketch_count"] += 1
+                    info["sketch_names"].append(f.Name)
+                elif feat_type == "Extrusion":
+                    info["extrusion_count"] += 1
+        except Exception:
             pass
         
         # Build readable message
@@ -1031,7 +1076,15 @@ async def main():
     """Main entry point for MCP server"""
     logger.info("Starting SolidWorks MCP Server v4.0.0 (Fixed)...")
     logger.info(f"Log file: {LOG_FILE}")
-    
+    # Load the makepy typelib up front: once it is imported, win32com hands
+    # out typed wrappers for some objects. Loading it lazily (first
+    # lookup_api_signature call) flipped dispatch behaviour mid-session.
+    try:
+        from .utils import get_sw_module
+        get_sw_module()
+    except Exception as e:
+        logger.warning(f"Typelib preload failed (SolidWorks installed?): {e}")
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

@@ -296,11 +296,13 @@ class DocumentOperations:
                                   SwErrors.swSuccess,
                                   {"path": filepath, "method": method_used})
             else:
-                # Save in place
-                result = doc.Save3(0, 0, 0)
-                
-                if result != 0:
-                    return self._result(False, f"Save failed (code {result})",
+                # Save in place (Save3 returns True on success; Errors and
+                # Warnings are out params -- see ext.save_in_place)
+                from .. import ext
+                ok, errs, warns = ext.save_in_place(ext.T(doc, "IModelDoc2"))
+
+                if not ok:
+                    return self._result(False, f"Save failed (errors={errs}, warnings={warns})",
                                       SwErrors.swFileSaveError)
                 
                 path = self._get_doc_path(doc)
@@ -329,7 +331,8 @@ class DocumentOperations:
             title = self._get_doc_title(doc)
             
             if save:
-                doc.Save3(0, 0, 0)
+                from .. import ext
+                ext.save_in_place(ext.T(doc, "IModelDoc2"))
             
             self._sw_app.CloseDoc(title)
             

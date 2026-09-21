@@ -11,10 +11,15 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
 
 ## Правила правки
 
-- **Правки .py-файлов не подхватываются на лету** — MCP-сервер уже запущен
-  как процесс. После любой правки в `solidworks_mcp/` попроси пользователя
-  переподключить/перезапустить MCP-сервер, и только потом проверяй —
-  иначе протестируешь старый код и решишь, что фикс не сработал.
+- **Правки кода: `reload_api`** перечитывает `automation/*` и `ext.py` с
+  диска без рестарта (COM-коннект сохраняется). Рестарт MCP нужен только
+  при изменении **схем** тулов (новый тул/параметр) и правках самого
+  `server.py`. Новое — писать в `ext.py` (он перезагружаемый).
+- **Типизированные обёртки вместо угадывания**: в новом коде любой COM-объект
+  — через `T(obj, "IFace2")`, член — через `v(obj, "Name")` (ext.py). У
+  makepy-обёртки метод/свойство определены типобиблиотекой, никакой
+  неоднозначности. Ловушки обёртки (пустой callout, `InsertRefPlane`
+  возвращает не фичу, `CreatePoint` портит массив) — [NOTES.md § Типизированные обёртки](NOTES.md#типизированные-обёртки-makepy--ловушки).
 - **Не угадывай параметры COM-методов.** Вызови тул `lookup_api_signature`
   (interface, member) — вернёт реальную сигнатуру из типобиблиотеки SW, а не
   из памяти/доки (которая для многих методов просто не совпадает с тем, что
@@ -23,12 +28,38 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
   (`swEndCondBlind` и т.п.) — тул `lookup_api_constant`. Первый вызов после
   рестарта SW генерирует кэш (~1-2 сек), дальше инстант. Детали механизма —
   [NOTES.md § Не угадывай сигнатуры](NOTES.md#не-угадывай-сигнатуры--используй-lookup_api_signature--lookup_api_constant).
-- **Property vs method неоднозначны** в этой COM-обёртке — `if
-  callable(x): x = x()` не работает (ломает обход дерева фич). Используй
-  `com_get(obj, name)` из `utils/com_helpers.py` для любого zero-arg члена.
+- **Property vs method неоднозначны** в *динамической* обёртке (старый код)
+  — `if callable(x): x = x()` не работает (ломает обход дерева фич). Там
+  `com_get(obj, name)` из `utils/com_helpers.py`; в новом коде — `T()`/`v()`.
   Детали и почему — [NOTES.md § win32com dynamic dispatch](NOTES.md#win32com-dynamic-dispatch-property-vs-method--неоднозначность).
 
 ## Возможности, которые уже есть — не изобретай заново
+
+- **Самопроверка каждого шага**: фичевые тулы (extrude/cut/revolve/fillet/
+  chamfer/hole/pattern/mirror/set_parameter/delete...) дописывают в ответ
+  дельту `Имя | V … mm³ (±…) | B1 F… E…` и ⚠, если объём не изменился как
+  ожидалось, тело распалось или у фичи ошибка перестроения. Отдельные
+  проверки объёма не нужны.
+- **Топология**: `inspect` (снимок детали), `list_faces`/`list_edges`
+  (компактные таблицы; `p` у грани — точка НА грани), `find_face`/`find_edge`,
+  `select_entities`. Индексы — в `fillet_edges`/`chamfer_edges(edge_indices)`,
+  `create_sketch_on_face(face_index)`. Индексы меняются после каждой фичи.
+- **Рамка эскиза**: `create_sketch*` пишет, куда смотрят оси эскиза в модели.
+  В этом шаблоне Front — нормаль X, Top — Z, Right — Y; на Top ось X эскиза
+  идёт вдоль мировой Y. Не угадывать — читать рамку.
+- **Полностью определённые эскизы — обязательно.** После рисования:
+  `sketch_entities` → `add_sketch_relation` / `add_sketch_dimension`
+  (с `link` на глобальную переменную) до статуса «fully defined». Осевую
+  линию для вращения не рисовать — `revolve_sketch(axis="Z")`. Детали —
+  [NOTES.md § Определённость эскизов](NOTES.md#определённость-эскизов-sketch_entities--add_sketch_relation--add_sketch_dimension).
+- **Нативные фичи, а не эмуляция**: фаска — `chamfer_edges`, не
+  вырез вращением; отверстие — `hole`, не вырез окружности.
+- **Отверстия / массивы / параметры / транзакции**: `hole` (Hole Wizard:
+  drill/tap/cbore, несколько точек), `circular_pattern`, `linear_pattern`,
+  `mirror_features`, `get/set/add_parameter`, `delete_feature`,
+  `suppress_feature`, `transaction(begin/commit/abort)`. Эмпирика по
+  Hole Wizard и уравнениям — [NOTES.md § Hole Wizard](NOTES.md#holewizard5--карта-value-слотов-проверено-sw-2026),
+  [§ Уравнения](NOTES.md#уравнения-iequationmgr).
 
 - **Скриншот детали**: тул `capture_view` → PNG, дальше смотреть через
   `Read` (это и есть визуальная проверка/описание внешнего вида — без
@@ -60,9 +91,12 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
 - `solidworks_mcp/utils/` — `com_helpers.py` (property/method), `typelib.py`
   (реальные сигнатуры/константы через makepy), `units.py`, `sw_finder.py`
   (автопоиск инсталляции SW через реестр).
-- `execute_python` (MCP-тул) — сырой доступ к `sw` (SldWorks.Application) и
-  `doc` (ActiveDoc) в том же процессе; используй для разведки перед тем как
-  чинить типизированный тул.
+- `solidworks_mcp/ext.py` — всё добавленное поверх апстрима: хелперы
+  (`T`, `v`, `snapshot`/`delta`, `face_rows`/`edge_rows`, `select_face_at`,
+  `NoInference`, `xform`), реализации новых тулов и их схемы (`TOOL_SCHEMAS`).
+- `execute_python` (MCP-тул) — сырой доступ в том же процессе: `sw`, `doc`,
+  `md` (typed IModelDoc2), `T`, `v`, `ext`. Переменные живут между вызовами,
+  вывод и traceback возвращаются вместе. Для разведки перед правкой тула.
 - `backup_20260209_*/` — снапшоты старых версий файлов, не апстрим и не
   рабочий код — не редактировать, не смотреть как источник истины.
 

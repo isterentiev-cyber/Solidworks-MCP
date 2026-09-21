@@ -69,13 +69,14 @@ body = doc.GetBodies2(0, True)[0]      # 0 = solid bodies, True = visible only
 faces = body.GetFaces()                 # метод, нужны скобки
 edges = body.GetEdges()                 # метод, нужны скобки
 
-# ISurface.Identity (swSurfaceTypes_e)
+# ISurface.Identity (swSurfaceTypes_e, сверено с swconst.tlb 2026-09-19):
 SURF_TYPES = {4001:"PLANE",4002:"CYLINDER",4003:"CONE",4004:"SPHERE",
-              4005:"TORUS",4006:"BSURF",4007:"BLENDSURF",4008:"OFFSETSURF",
-              4010:"EXTRUSION",4011:"REVOLUTION"}
-# ICurve.Identity — эмпирически в этой версии SW: 3001=LINE, 3002=CIRCLE
-# (официальный enum swCurveTypes_e другой — не доверять доке, сверять по факту
-# через lookup_api_constant/lookup_api_signature)
+              4005:"TORUS",4006:"BSURF",4007:"BLEND",4008:"OFFSET",
+              4009:"EXTRU",4010:"SREV"}
+# (раньше здесь было 4010=EXTRUSION, 4011=REVOLUTION — неверно)
+# ICurve.Identity (swCurveTypes_e): 3001 LINE, 3002 CIRCLE, 3003 ELLIPSE,
+# 3004 INTERSECTION, 3005 BCURVE, 3006 SPCURVE, 3008 CONSTPARAM, 3009 TRIMMED
+# — совпадает с официальным enum. Готовые таблицы: тулы list_faces/list_edges.
 
 for face in faces:
     surf = face.GetSurface          # property, без скобок
@@ -219,6 +220,259 @@ sm.AddToDB = False; sm.AutoInference = True
   граней-границ вместо blind-глубины;
 - как временный практичный обход — не резать паз в этом инструменте вообще,
   а делать его вручную в SW UI после автогенерации остального тела.
+
+## CreateCircle тихо возвращает None без AddToDB/AutoInference
+
+`ISketchManager.CreateCircle`/`CreateCircleByRadius` в этой инсталляции, как
+и `CreateCornerRectangle` (см. выше про шпоночные пазы), **тихо проваливаются**
+(`None`, без исключения) при вызове "в лоб" — даже в чистом новом эскизе на
+Front Plane, даже в начале координат. Рабочий тул `draw_circle` не знает про
+этот обход и потому падает с `[ERROR] Failed - ensure sketch is active`, хотя
+эскиз активен. Фикс — тот же, что и для прямоугольника:
+```python
+sm.AddToDB = True; sm.AutoInference = False
+c = sm.CreateCircle(xc, yc, 0, xc+r, yc, 0)
+sm.AddToDB = False; sm.AutoInference = True
+```
+Проверено многократно (8 отверстий подряд в одном эскизе) — деталь
+`side-rail.SLDPRT` в проекте Demo, 2026-09-12. `draw_line` этой проблемы не
+имеет — линии создаются без обхода.
+
+## FeatureCut3/4 на эскизе, лежащем на референс-плоскости (не на грани тела)
+
+Cut-вырез по эскизу, нарисованному прямо на Front/Top/Right Plane (а не на
+грани тела через `create_sketch_on_face`), в этой инсталляции требует
+`Dir=True` (3-й параметр) — с `Dir=False` вызов возвращает `None` без ошибки
+независимо от `T1`/`Flip`/`UseFeatScope` и т.д. Найдено перебором всех 4
+комбинаций `Flip×Dir` — сработала только `(Flip=False, Dir=True)`. Тул
+`cut_extrude` этого не учитывает (`Dir` в нём всегда `False`), поэтому для
+такого случая резать через `execute_python` напрямую:
+```python
+fm.FeatureCut3(True, False, True, 1, 0, 0, 0, False, False, False, False,
+               0, 0, False, False, False, False, False,
+               True, True, True, True, False, 0, 0, False)
+```
+(`T1=1` = ThroughAll). Проверено на детали `side-rail.SLDPRT`, 2026-09-12.
+Не проверено, нужен ли тот же `Dir=True` для cut на грани тела
+(`create_sketch_on_face`) — там пока не тестировалось.
+
+## Сборки (IAssemblyDoc): вставка компонентов и мейты через API
+
+Рецепт, доведённый до рабочего результата (панель лестницы, 2 боковины + 8
+перекладин на реальных мейтах, `ladder-panel.SLDASM` в проекте Demo,
+2026-09-12):
+
+**`AddComponent5(path, 0, "", False, "", X, Y, Z)`** — `X,Y,Z` позиционируют
+не origin детали, а **центр её bounding box** в глобальных координатах
+сборки. Т.е. итоговая трансляция origin = `(X,Y,Z) - local_bbox_center`.
+Проверять через `component.Transform2.ArrayData[9:12]` (translation),
+`[0:9]` — 3×3 поворот.
+
+**Фиксация первого компонента**: выделить его (`SelectByID2(...,"COMPONENT",...)`)
+и вызвать `doc.FixComponent()` — обычный `IAssemblyDoc` метод, работает
+без сюрпризов.
+
+**Имя подобъекта компонента для `SelectByID2`**: `"ИмяФичи@ИмяКомпонента@ИмяСборки"`
+— два `@`, третий сегмент обязателен (просто `"Front Plane@side-rail-1"`
+без имени сборки тихо возвращает `False`, без исключения). Работает и для
+`"PLANE"` (базовые плоскости компонента), и для `"COMPONENT"` (сам
+компонент, тогда достаточно `"ИмяКомпонента@ИмяСборки"`).
+
+**`AddMate5(MateTypeFromEnum, AlignFromEnum, Flip, Distance, DistUpper,
+DistLower, GearNum, GearDenom, Angle, AngleUpper, AngleLower,
+ForPositioningOnly, LockRotation, WidthMateOption, ErrorStatus)`** — 14
+входных + 1 out-параметр (`ErrorStatus`, передавать как
+`win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)`).
+Работает сразу, без сюрпризов с числом параметров (в отличие от
+Revolve/Chamfer/Cut). `swMateCOINCIDENT=0`, `swMateCONCENTRIC=1`,
+`swMateDISTANCE=5` (см. `lookup_api_constant`, не грепать по памяти).
+Селектить обе стороны мейта заранее: первая `SelectByID2(..., Append=False,
+Mark=1, ...)`, вторая `Append=True, Mark=1`, затем `AddMate5(...)`.
+
+**Мейты между рёбер плоскостей двух копий одной и той же детали** — рабочий
+паттерн, чтобы полностью (без остаточных DOF) поставить вторую копию
+параллельно первой на заданном расстоянии: 2× `Coincident` между парой
+одноимённых базовых плоскостей, ориентированных перпендикулярно направлению
+сдвига (например `Right Plane`↔`Right Plane`, `Top Plane`↔`Top Plane`, если
+сдвиг вдоль нормали `Front Plane`), + 1× `Distance` между `Front
+Plane`↔`Front Plane` на нужную величину. Проверено — DOF=0, `EditRebuild3`
+без ошибок.
+
+**Ловушка: выбор грани по координате (`SelectByID2(...,"FACE",x,y,z,...)`)
+в сборке неоднозначен, если в этой точке геометрически совпадают/пересекаются
+элементы РАЗНЫХ компонентов** — например, деталь-заготовка (`rung`),
+вставленная "начерно" в грубую позицию для мейта, случайно оказалась на той
+же оси (Y,Z), что и отверстие в другой детали, предназначенное для ДРУГОГО
+экземпляра той же заготовки (совпадение чисто по значениям координат,
+использованных для расстановки). `SelectByID2` в этом случае тихо хватает
+не ту грань, и последующий `AddMate5` возвращает `None` без диагностики.
+Итог был виден только визуально (скриншотом) — 2 из 8 перекладин не
+встали. **Фикс**: перед мейтингом расставлять "черновые" компоненты так,
+чтобы их пробные координаты заведомо не совпадали ни с одним другим
+элементом сборки (например, сдвинуть по оси, не участвующей в дальнейшем
+мейте — вставить `rung` на `Y=2.0` вместо `Y=0`, раз мейт всё равно её
+переставит по концентричности). Общий вывод: при координатном выборе граней
+в сборке — всегда держать пробные позиции черновых компонентов в заведомо
+"пустом" углу пространства, не полагаться на то, что "непохожие" номера
+не совпадут численно.
+
+## Типизированные обёртки (makepy) — ловушки
+
+Контекст (2026-09-19): как только typelib загружен (`lookup_api_signature`
+или, с этого дня, старт сервера), win32com начинает отдавать часть объектов
+типизированными (`GetBodies2` → `IBody2`, `Dispatch("SldWorks.Application")`
+→ `ISldWorks`), а часть — динамическими (`ActiveDoc`). Смесь непредсказуема,
+поэтому новый код всё оборачивает сам: `ext.T(obj, "IFace2")`, члены читает
+через `ext.v(obj, "Name")` (вызов, если по typelib это метод).
+
+- У типизированной `ISldWorks` `RevisionNumber` — метод: голое чтение
+  атрибута «успешно» даже при мёртвом SW → `is_connected` врал. Теперь
+  `com_get`.
+- `IFeature.GetTypeName2` в typed-обёртке — **метод** (в динамической было
+  свойство). `IsSuppressed` — тоже через `v()`.
+- `SelectByID2`: typed хочет `Callout=None` (на `VARIANT(VT_DISPATCH)` —
+  `TypeError`), динамический — наоборот (на `None` — `DISP_E_TYPEMISMATCH`).
+  `ext.select_by_id` пробует оба.
+- **`SelectByID2("", "FACE", x, y, z)` возвращает False** даже для точки
+  ровно на плоской грани (в обоих режимах). `SelectByRay` работает и
+  сохраняет точку выбора — `ext.select_face_at(md, p_mm)` ищет грань через
+  `GetClosestPointOn` и стреляет лучом по нормали.
+- `InsertRefPlane` возвращает `IRefPlane`, **не** `IFeature` — переименование
+  через `T(ref, "IFeature").Name = …` даёт «Type mismatch». Новая фича —
+  последняя в дереве. Параметры-double передавать float (0 вместо 0.0 в
+  динамическом вызове тоже даёт Type mismatch).
+- `IMathUtility.CreatePoint([..])` через typed-обёртку получает мусор
+  (1e-311). Преобразования считать самому по `IMathTransform.ArrayData`:
+  `p' = (p · R) * scale + t`, R = a[0:9] построчно, t = a[9:12] (`ext.xform`).
+- Середина ребра по `Evaluate2((umin+umax)/2)` для прямых может уехать за
+  ребро (у линии был mid y=-80 при ребре -40..40): для LINE — среднее
+  концов, для остальных — `IEdge.GetClosestPointOn`.
+- `MassProperty`: `doc.Extension.CreateMassProperty` в динамическом режиме —
+  «свойство», вызов со скобками падает. Через `v()` без разницы.
+
+## Мелкие исправления тулов (2026-09-19)
+
+- `FeatureFillet3` — 14 параметров, апстрим звал с 15 → всегда падал на
+  `SimpleFillet`. Исправлено; рёбра выбирать с Mark=1.
+- `InsertFeatureChamfer` — `ChamferType=0` не значение enum; угол-дистанция
+  = `swChamferAngleDistance` = 1.
+- `swDelete_Absorbed` = **2**, `swDelete_Children` = 1 (не наоборот).
+  `DeleteSelection2(0)` удаляет фичу, оставляя её эскиз.
+- `extrude_sketch`/`cut_extrude` брали «последний эскиз» даже если он уже
+  поглощён фичей — при упавшем `create_sketch` получался Boss-Extrude нулевого
+  объёма поверх старого. Теперь отказ с объяснением (эскиз с `GetChildren()`).
+- `revolve_sketch(cut=True)` передавал `IsSolid=False` → SW строил
+  **Surface-Revolve** вместо выреза (объём не менялся, ошибки нет). `IsSolid`
+  всегда True, режет `IsCut`. Поймано дельтой («nothing was removed»).
+- `save_document` без пути: `Save3(Options, Errors, Warnings)` — два out-
+  параметра, апстрим передавал int → «Type mismatch»; и успех проверял как
+  `!= 0`, хотя метод возвращает True. `ext.save_in_place`.
+- `cut_extrude` проверяет, что объём реально уменьшился; если нет — удаляет
+  пустую фичу и повторяет с другим `Dir`. Покрывает случай «эскиз на
+  референс-плоскости режет только с Dir=True».
+
+## HoleWizard5 — карта Value-слотов (проверено SW 2026)
+
+Перед вызовом — выбрать грань **с точкой** (`select_face_at`): отверстие
+встаёт в точку выбора. Сигнатура: `(GenericHoleType, StandardIndex,
+FastenerTypeIndex, SSize, EndType, Diameter, Depth, Length, Value1..Value12,
+ThreadClass, RevDir, FeatureScope, AutoSelect, AssemblyFeatureScope,
+AutoSelectComponents, PropagateFeatureToParts)`. `-1` в Value **не**
+универсальное «по умолчанию»:
+
+| тип | что работает |
+|---|---|
+| `swWzdHole` (2), ISO drill sizes (143) | `SSize="Ø6.0"` (с `.0`, символ U+00D8), Value2 = угол сверла (рад), остальные Value = 0. С -1 и through-all → None |
+| `swWzdTap` (4), ISO tapped hole (147) | Diameter = сверло под резьбу, Depth = глубина сверла, **Value1 = глубина резьбы**, остальные -1 (Value6=0 или Value1=0 → дюймовый профиль 25.4 мм + warning). Диаметр резьбы берётся из SSize |
+| `swWzdCounterBore` (0), ISO 4762 (139) | Diameter=-1, все Value=-1 → правильные ISO-посадки (M5: Ø5.5 / Ø10×5.4) |
+
+После создания резьбового отверстия через `IWizardHoleFeatureData2`
+(`AccessSelections` → поля → `feature.ModifyDefinition(data, md, None)`):
+- HoleWizard5 всегда строит «remove thread» (Type 31: ступень Ø-major на
+  глубину резьбы). Косметическая: `Type = swTapBlindCosmeticThread` (46) /
+  `swTapThruCosmeticThread` (48), `CosmeticThreadType = 1`.
+- Угол сверла у резьбы ни один Value-слот не задаёт (выходит ~0.3° — игла на
+  7 мм): `DrillAngle = radians(118)` **отдельным** ModifyDefinition — смена
+  Type в том же вызове сбрасывает угол.
+- Позиции: первый подэскиз фичи — точки размещения, второй — профиль
+  вращения. Доп. точки — `EditSketch` первого + `CreatePoint` в координатах
+  эскиза.
+
+## Уравнения (IEquationMgr)
+
+- `Add3(index, eq, solve, config, names)` возвращает -1 на любом входе
+  (пробовал config 1/2, names None/[]). **`Add2(-1, eq, True)` работает.**
+- `SetEquationAndConfigurationOption` → -1, ничего не меняет.
+  **`SetEquation(i, eq)`** (сеттер параметризованного свойства) работает.
+- `Equation(i)`, `Value(i)`, `GlobalVariable(i)` в typed-обёртке — методы.
+- Размер: `md.Parameter("D1@Boss-Extrude1")` → `IDimension.SetSystemValue3(m,
+  swAllConfiguration, None)`; привязка к переменной — уравнение
+  `"D1@Boss-Extrude1" = "h"`.
+
+## Массивы и зеркало
+
+- `FeatureCircularPattern5`: ось — Mark 1, фичи — Mark 4. Ось-фича
+  (`InsertAxis2` из двух плоскостей) работает, цилиндрическая грань тоже.
+  **None без диагностики, если экземпляр ложится ровно в/на существующий
+  вырез** (тест: 6 копий, одна попала в карман Cut-Extrude1; 5 копий — ок).
+  Та же история с `InsertMirrorFeature2` (плоскость Mark 2, фичи Mark 1).
+- `FeatureLinearPattern5`: направление Mark 1 (2-е — Mark 2), фичи Mark 4;
+  ось-фича как направление работает.
+- `md.BlankRefGeom()` / `md.UnBlankRefGeom()` (с большой B) — скрыть/показать
+  выбранную ось/плоскость.
+
+## Транзакции
+
+`Extension.StartRecordingUndoObject()` → операции →
+`FinishRecordingUndoObject2(name, False)`; откат — `EditUndo2(1)`. Проверено:
+один `EditUndo2(1)` откатил эскиз + выдавливание + подавление скругления
+разом, объём вернулся точно. На всякий случай `transaction abort` после undo
+удаляет оставшиеся новые фичи.
+
+## Определённость эскизов (sketch_entities / add_sketch_relation / add_sketch_dimension)
+
+Правило: эскиз, который ведёт фичу, должен быть **полностью определён** —
+иначе это не параметрическая модель, а геометрия «где нарисовалась».
+`delta` предупреждает, если новая фича стоит на недоопределённом эскизе.
+
+- Статус: `ISketch.GetConstrainedStatus()` — 2 under, 3 fully, 4 over, 5 no
+  solution. Сущности: `GetSketchSegments()` (тип 0 line, 1 arc/circle),
+  `GetSketchPoints2()`; начало координат в эскизе —
+  `SelectByID2("Point1@Origin", "EXTSKETCHPOINT")`.
+- Связи: выбрать сущности (`ISketchSegment/ISketchPoint.Select4`) →
+  `md.SketchAddConstraints("sgCONCENTRIC")` и т.п. Для двух точек
+  горизонталь — `sgHORIZONTALPOINTS2D`, для линии — `sgHORIZONTAL2D`.
+- Размеры: выбрать → `AddDiameterDimension2 / AddHorizontalDimension2 /
+  AddVerticalDimension2 / AddRadialDimension2 / AddDimension2(x,y,z)` —
+  координаты текста модельные. Перед этим выключить диалог ввода значения:
+  `SetUserPreferenceToggle(swInputDimValOnCreate=10, False)`.
+- Две окружности, нарисованные в одну точку центра, получают общий центр
+  (P1 один) — concentric уже по факту.
+- Привязка размера к переменной (уравнение + EvaluateAll) **выкидывает SW из
+  режима редактирования эскиза** — тул возвращает эскиз (`EditSketch`).
+- `GetFirstDisplayDimension` у фичи без размеров отдаёт int 0 вместо
+  Nothing — makepy падает с `'int' has no attribute GetTypeInfo`. Обёртка
+  `ext.display_dims()`.
+- **`T(obj, "IFeature")` для ISketch не работает** даже с QueryInterface: QI
+  проходит, но IDispatch всё равно диспетчит по таблице ISketch (`.Name`
+  вернул кортеж-трансформацию). Фичу эскиза искать по COM-идентичности
+  (`ext.sketch_feature`). Общий вывод: T() надёжен только для «своего»
+  интерфейса объекта.
+
+## Revolve вокруг оси вне эскиза
+
+`FeatureRevolve2` без осевой линии: эскиз Mark 0 + ось (ось-фича, ребро)
+**Mark 4**. Не нужно определять осевую линию в эскизе. Ось `InsertAxis2` из
+двух плоскостей смотрит в **-Z** → 90° уходит в -Y; поправить можно без
+пересоздания: `IRevolveFeatureData2.ReverseDirection` + `ModifyDefinition`.
+Ось создавать ДО выбора эскиза (создание сбрасывает выбор).
+
+## Фаска на кромке тор/плоскость
+
+`InsertFeatureChamfer` на кромке торца гнутой трубы строит грань **BSURF**
+(сплайн), а не конус — сторона по тору меряется вдоль кривой поверхности.
+Это нормально; торец проверять по площади кольца (1×45 на Ø21.3 → кольцо до
+Ø19.3).
 
 ## Известные открытые вопросы
 

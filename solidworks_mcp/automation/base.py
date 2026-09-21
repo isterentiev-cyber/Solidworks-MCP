@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 class SolidWorksAutomation:
     """
     Core SolidWorks automation class
-    
+
     Handles connection management, document operations, and provides
     utility methods for all automation tasks.
     """
-    
+
     def __init__(self):
         """Initialize automation instance"""
         self._sw_app = None
@@ -37,59 +37,56 @@ class SolidWorksAutomation:
         self._config = get_config()
         self._units = UnitConverter(self._config.default_unit)
         self._sw_exe_path = None
-        
+
         logger.info("SolidWorksAutomation initialized")
-    
+
     # ========================================================================
     # Properties
     # ========================================================================
-    
+
     @property
     def is_connected(self) -> bool:
         """Check if connected to SolidWorks"""
         if not self._connected or self._sw_app is None:
             return False
-        
+
         try:
-            # Test connection by accessing a property
-            _ = self._sw_app.RevisionNumber
+            # com_get actually invokes the member on a makepy-typed app too
+            # (there RevisionNumber is a method, and a bare attribute read
+            # would "succeed" even with SolidWorks gone).
+            _ = com_get(self._sw_app, "RevisionNumber")
             return True
         except:
-            try:
-                # Some versions use method instead of property
-                _ = self._sw_app.RevisionNumber()
-                return True
-            except:
-                self._connected = False
-                self._sw_app = None
-                return False
-    
+            self._connected = False
+            self._sw_app = None
+            return False
+
     @property
     def units(self) -> UnitConverter:
         """Get unit converter"""
         return self._units
-    
+
     @property
     def app(self):
         """Get SolidWorks application object"""
         return self._sw_app
-    
+
     # ========================================================================
     # Result Helper
     # ========================================================================
-    
+
     def _result(self, success: bool, message: str,
                 error_code: SwErrors = SwErrors.swSuccess,
                 data: Optional[Dict] = None) -> Dict:
         """
         Create standardized result dictionary
-        
+
         Args:
             success: Operation success status
             message: Human-readable message
             error_code: Error code enum
             data: Optional additional data
-        
+
         Returns:
             Standardized result dictionary
         """
@@ -103,15 +100,15 @@ class SolidWorksAutomation:
         if data:
             result["data"] = data
         return result
-    
+
     # ========================================================================
     # Connection Methods
     # ========================================================================
-    
+
     def _try_connect_com(self) -> bool:
         """
         Try multiple COM connection methods
-        
+
         Returns:
             True if connection successful
         """
@@ -125,105 +122,96 @@ class SolidWorksAutomation:
             # Method 4: GetActiveObject
             lambda: win32com.client.GetActiveObject("SldWorks.Application"),
         ]
-        
+
         for i, method in enumerate(methods):
             try:
                 logger.debug(f"Trying connection method {i+1}...")
                 pythoncom.CoInitialize()
                 self._sw_app = method()
-                
+
                 if self._sw_app is not None:
                     self._sw_app.Visible = True
-                    
+
                     # Get version (property or method)
-                    try:
-                        version = self._sw_app.RevisionNumber
-                    except:
-                        version = self._sw_app.RevisionNumber()
-                    
+                    version = com_get(self._sw_app, "RevisionNumber")
+
                     logger.info(f"Connected via method {i+1}: {version}")
                     self._connected = True
                     return True
-                    
+
             except Exception as e:
                 logger.debug(f"Method {i+1} failed: {e}")
                 continue
-        
+
         return False
-    
+
     def connect(self) -> Dict:
         """
         Connect to SolidWorks - launches if not running
-        
+
         Returns:
             Result dictionary with connection status
         """
         try:
             logger.info("=== Connecting to SolidWorks ===")
-            
+
             # Step 1: Try connecting to running instance
             if self._try_connect_com():
-                try:
-                    version = self._sw_app.RevisionNumber
-                except:
-                    version = self._sw_app.RevisionNumber()
-                
+                version = com_get(self._sw_app, "RevisionNumber")
+
                 return self._result(True, f"Connected to SolidWorks {version}",
                                   SwErrors.swSuccess,
                                   {"version": str(version), "launched": False})
-            
+
             # Step 2: Find SolidWorks executable
             if self._sw_exe_path is None:
                 if self._config.exe_path != "auto":
                     self._sw_exe_path = self._config.exe_path
                 else:
                     self._sw_exe_path = find_solidworks()
-            
+
             if not self._sw_exe_path or not os.path.exists(self._sw_exe_path):
                 return self._result(False,
                     f"SolidWorks not found. Set exe_path in config or install SolidWorks.",
                     SwErrors.swSolidWorksNotFound)
-            
+
             # Step 3: Launch SolidWorks
             logger.info(f"Launching SolidWorks: {self._sw_exe_path}")
             os.startfile(self._sw_exe_path)
-            
+
             # Step 4: Wait for SolidWorks to start
             logger.info("Waiting for SolidWorks startup...")
             max_wait = self._config.startup_timeout
             retry_interval = self._config.connection_retry_interval
             start_time = time.time()
-            
+
             while time.time() - start_time < max_wait:
                 time.sleep(retry_interval)
                 elapsed = int(time.time() - start_time)
                 logger.debug(f"Connection attempt at {elapsed}s...")
-                
+
                 if self._try_connect_com():
-                    try:
-                        version = self._sw_app.RevisionNumber
-                    except:
-                        version = self._sw_app.RevisionNumber()
-                    
+                    version = com_get(self._sw_app, "RevisionNumber")
+
                     logger.info(f"Connected after {elapsed}s")
                     return self._result(True,
                         f"Launched and connected to SolidWorks {version} (took {elapsed}s)",
                         SwErrors.swSuccess,
                         {"version": str(version), "launched": True, "startup_time": elapsed})
-            
+
             return self._result(False,
                 f"Timeout after {max_wait}s. Close any dialogs and try again.",
                 SwErrors.swConnectionError)
-            
+
         except Exception as e:
             logger.error(f"Connection error: {e}\n{traceback.format_exc()}")
             return self._result(False, f"Connection error: {e}",
                               SwErrors.swConnectionError)
-    
+
     def disconnect(self) -> Dict:
         """
         Disconnect from SolidWorks (does not close SolidWorks)
-        
+
         Returns:
             Result dictionary
         """
@@ -231,15 +219,15 @@ class SolidWorksAutomation:
         self._connected = False
         logger.info("Disconnected from SolidWorks")
         return self._result(True, "Disconnected from SolidWorks")
-    
+
     # ========================================================================
     # Document Methods
     # ========================================================================
-    
+
     def get_active_doc(self) -> Tuple[Any, Optional[Dict]]:
         """
         Get active document with auto-connect
-        
+
         Returns:
             Tuple of (document, error_result)
             - If successful: (document, None)
@@ -249,15 +237,15 @@ class SolidWorksAutomation:
             result = self.connect()
             if not result["success"]:
                 return None, result
-        
+
         doc = self._sw_app.ActiveDoc
         if doc is None:
             return None, self._result(False,
                 "No document open. Use create_new_part first.",
                 SwErrors.swNoActiveDocument)
-        
+
         return doc, None
-    
+
     def _get_doc_title(self, doc) -> str:
         """Get document title (handles property/method difference)"""
         try:
