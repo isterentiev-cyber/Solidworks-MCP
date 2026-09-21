@@ -26,7 +26,7 @@ from typing import Dict
 from pathlib import Path
 
 # MCP imports
-from mcp.server import Server
+from mcp.server import Server, NotificationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
@@ -663,6 +663,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "reload_api":
             result = _reload_api()
+            if result.get("success"):
+                # list_tools() reads ext.TOOL_SCHEMAS at call time and
+                # importlib.reload mutates the module in place, so the fresh
+                # list is already what the next tools/list would return --
+                # the client just has to be told to ask again.
+                try:
+                    await server.request_context.session.send_tool_list_changed()
+                    result["message"] += " | tools/list_changed sent"
+                except Exception as e:
+                    logger.warning(f"send_tool_list_changed failed: {e}")
+                    result["message"] += (
+                        f" | could NOT notify the client ({e}) -- "
+                        f"restart the MCP client to see new tools"
+                    )
 
         elif name in ext.HANDLERS:
             result = ext.dispatch(name, arguments, sw_automation)
@@ -764,6 +778,7 @@ def _execute_python_fixed(code: str) -> Dict:
 
 _RELOAD_ORDER = [
     "solidworks_mcp.utils.com_helpers",
+    "solidworks_mcp.toolsets",
     "solidworks_mcp.ext",
     "solidworks_mcp.automation.base",
     "solidworks_mcp.automation.documents",
@@ -1092,7 +1107,15 @@ async def main():
         logger.warning(f"Typelib preload failed (SolidWorks installed?): {e}")
 
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+        # tools_changed advertises tools.listChanged, which is what lets
+        # reload_api add a NEW tool without restarting the MCP client.
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options(
+                NotificationOptions(tools_changed=True)
+            ),
+        )
 
 
 def run():
