@@ -36,6 +36,7 @@ from .constants import SwErrors
 from .config import get_config, save_config
 from .utils import get_solidworks_info, set_default_unit, com_get, get_signature, get_constant
 from . import ext
+from . import toolsets
 
 # Configure logging
 config = get_config()
@@ -430,7 +431,12 @@ async def list_tools() -> list[Tool]:
             }
         ),
     ]
-    return base + [Tool(name=n, description=d, inputSchema=s) for n, d, s in ext.TOOL_SCHEMAS]
+    all_tools = base + [Tool(name=n, description=d, inputSchema=s)
+                        for n, d, s in ext.TOOL_SCHEMAS]
+    # Trim the list to the sections asked for in SW_MCP_TOOLSETS. Every
+    # schema here is re-sent to the model on every request, so an unused
+    # half of the list is pure context cost. See solidworks_mcp/toolsets.py.
+    return toolsets.filter_tools(all_tools)
 
 
 # ============================================================================

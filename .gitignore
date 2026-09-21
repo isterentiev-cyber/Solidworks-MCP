@@ -9,3 +9,8 @@ solidworks_mcp.log
 dist/
 build/
 *.egg-info/
+
+# Generated from the installed SolidWorks typelib -- machine-specific,
+# rebuilt in seconds by scripts/swapi.py build. Never commit.
+.gen_py/
+api-index/

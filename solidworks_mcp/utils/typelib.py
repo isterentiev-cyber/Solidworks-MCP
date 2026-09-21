@@ -25,11 +25,79 @@ MCP tools instead of writing this by hand):
     print(get_constant("swRefPlaneReferenceConstraint_Distance"))
 """
 
+import os
+import sys
 import inspect
 import logging
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Where the generated makepy cache lives
+# ---------------------------------------------------------------------------
+# pywin32 defaults to %TEMP%\gen_py\<pyver>, which any disk cleanup wipes and
+# which a Python version bump orphans. The cache is ~7 MB and takes a couple of
+# seconds to rebuild, but it rebuilds *silently and at the worst moment* -- the
+# first lookup_api_signature of a session. Pin it inside the repo instead.
+#
+# Override with SW_MCP_GEN_PY if you want it somewhere else.
+# The directory is generated, machine-specific and gitignored -- never commit it.
+
+_GEN_PATH_DONE = False
+
+
+def _stable_gen_path() -> str:
+    """Repo-local makepy cache directory (absolute)."""
+    override = os.environ.get("SW_MCP_GEN_PY", "").strip()
+    if override:
+        return os.path.abspath(override)
+    return str(Path(__file__).resolve().parents[2] / ".gen_py")
+
+
+def _relocate_gen_cache() -> str:
+    """Point win32com's generated-code cache at a stable directory.
+
+    Must run before gencache generates or loads anything. gencache reads
+    win32com.__gen_path__ on every call (not via `from ... import`), so
+    reassigning the attribute is enough -- except for its dicts.dat index,
+    which it loaded at import time from the OLD path. That one gets reloaded
+    here explicitly.
+    """
+    global _GEN_PATH_DONE
+    if _GEN_PATH_DONE:
+        return _stable_gen_path()
+
+    import win32com
+
+    target = _stable_gen_path()
+    current = getattr(win32com, "__gen_path__", "")
+    if os.path.normcase(os.path.abspath(current)) == os.path.normcase(target):
+        _GEN_PATH_DONE = True
+        return target
+
+    os.makedirs(target, exist_ok=True)
+    win32com.__gen_path__ = target
+    gen_py_mod = sys.modules.get("win32com.gen_py")
+    if gen_py_mod is not None:
+        gen_py_mod.__path__ = [target]
+
+    from win32com.client import gencache
+
+    gencache.clsidToTypelib.clear()
+    gencache.versionRedirectMap.clear()
+    try:
+        gencache._LoadDicts()
+    except OSError:
+        # No dicts.dat in the fresh directory yet -- build one. verbose=0 is
+        # not optional: this process speaks MCP over stdout, and Rebuild()
+        # prints progress there by default, which corrupts the protocol.
+        gencache.Rebuild(verbose=0)
+
+    logger.info(f"makepy cache: {current or '(default)'} -> {target}")
+    _GEN_PATH_DONE = True
+    return target
 
 # Typelib descriptions to search for (see selecttlb.EnumTlbs()). Matched by
 # substring so this doesn't need updating every SW version bump (e.g. covers
@@ -63,6 +131,8 @@ def _ensure_module(name_hints, cache_attr):
     cached = globals()[cache_attr]
     if cached is not None:
         return cached
+
+    _relocate_gen_cache()
 
     from win32com.client import makepy
     import win32com.client.gencache as gencache
