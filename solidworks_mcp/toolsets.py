@@ -111,6 +111,7 @@ TOOLSETS: Dict[str, Set[str]] = {
         "add_drawing_view",
         "add_section_view",
         "add_detail_view",
+        "add_broken_out_section",
         "insert_model_dimensions",
         "add_note",
         "export_pdf",

@@ -16,6 +16,7 @@ Design rules (see CLAUDE.md / NOTES.md):
   every token counts.
 """
 
+import json
 import math
 import os
 import tempfile
@@ -2090,6 +2091,123 @@ def t_add_detail_view(app, args):
                f"'{source}' at {fnum(scale)}:1 | views {before}->{after}")
 
 
+def _half_depth_mm(view) -> float:
+    """Half the part's extent along the view direction, in model mm -- the
+    depth that cuts a broken-out section exactly to the middle plane. For a
+    body of revolution seen from the side that is the outer radius (Ø1230 ring
+    -> 615, which is what the user set by hand on kolco-flanec-1230 View9).
+    Body boxes are axis-aligned, so this is exact for standard views of parts
+    whose axes follow the model frame."""
+    rmd = T(view.ReferencedDocument, "IModelDoc2") if view.ReferencedDocument is not None else None
+    if rmd is None or not is_part(rmd):
+        raise ExtError(f"View '{view.GetName2()}' does not show a part -- give depth explicitly")
+    a = list(T(view.ModelToViewTransform, "IMathTransform").ArrayData)
+    s = a[12] if len(a) > 12 and a[12] else 1.0
+    zs = []
+    for b in bodies(rmd):
+        bx = b.GetBodyBox()
+        for i in (0, 3):
+            for j in (1, 4):
+                for k in (2, 5):
+                    zs.append(xform(a, [bx[i], bx[j], bx[k]])[2])
+    if not zs:
+        raise ExtError(f"Part in '{view.GetName2()}' has no bodies")
+    return (max(zs) - min(zs)) / s / 2.0 * 1000.0
+
+
+def _broken_out_names(md, view_feature: str) -> set:
+    out = set()
+    f = md.FirstFeature()
+    while f is not None:
+        ff = T(f, "IFeature")
+        if ff.GetTypeName2() == "DrSheet":
+            sub = ff.GetFirstSubFeature()
+            while sub is not None:
+                sf = T(sub, "IFeature")
+                if sf.Name == view_feature:
+                    ss = sf.GetFirstSubFeature()
+                    while ss is not None:
+                        s3 = T(ss, "IFeature")
+                        if s3.GetTypeName2() == "DrBreakoutSectionLine":
+                            out.add(s3.Name)
+                        ss = s3.GetNextSubFeature()
+                sub = sf.GetNextSubFeature()
+        f = ff.GetNextFeature()
+    return out
+
+
+def t_add_broken_out_section(app, args):
+    """Broken-out section on an existing view: a closed contour drawn in the
+    view's sketch, selected, then IDrawingDoc.CreateBreakOutSection(depth).
+    Depth is a MODEL distance from the nearest point of the part. The user's
+    way to section a body of revolution (2026-09-23): ONE side view + a
+    broken-out section around the whole view, depth = outer radius -- a full
+    hatched section with no end view, section line or 'A-A' label. So the
+    defaults are: contour = the view outline + margin, depth = half the part's
+    extent along the view direction (= the outer radius for such a part).
+    After creation the contour is absorbed by the feature: IBrokenOutSection-
+    FeatureData.SketchSegment reads back None and its sketches report 0
+    segments, so the contour cannot be inspected afterwards (confirmed live
+    2026-09-23) -- the depth can (Depth, metres)."""
+    drw = drawing(app)
+    md = model(app)
+    view, fname = _find_view(drw, md, str(args["view"]))
+    disp = view.GetName2()
+
+    depth = args.get("depth")
+    depth_mm = float(depth) if depth not in (None, "", 0) else _half_depth_mm(view)
+    if depth_mm <= 0:
+        raise ExtError(f"depth must be > 0 mm (got {fnum(depth_mm)})")
+
+    pts = args.get("points")
+    if pts:
+        poly = json.loads(pts) if isinstance(pts, str) else pts
+        if len(poly) < 3:
+            raise ExtError("points: need at least 3 [x,y] sheet-mm pairs for a closed contour")
+    else:
+        o = [c * 1000.0 for c in view.GetOutline()]
+        mg = float(args.get("margin", 2))
+        poly = [[o[0] - mg, o[1] - mg], [o[2] + mg, o[1] - mg],
+                [o[2] + mg, o[3] + mg], [o[0] - mg, o[3] + mg]]
+
+    view = _activate_view(drw, disp)
+    sm = T(md.SketchManager, "ISketchManager")
+    a = _view_sketch_xform(view)
+    sk_pts = [sheet_to_view_sketch(a, float(p[0]), float(p[1])) for p in poly]
+    segs = []
+    with NoInference(sm):
+        for i in range(len(sk_pts)):
+            p, q = sk_pts[i], sk_pts[(i + 1) % len(sk_pts)]
+            ln = sm.CreateLine(p[0], p[1], 0.0, q[0], q[1], 0.0)
+            if ln is None:
+                for s in segs:
+                    _discard_segment(drw, md, disp, s)
+                raise ExtError(f"CreateLine returned None for contour edge {i + 1}")
+            segs.append(T(ln, "ISketchSegment"))
+
+    md.ClearSelection2(True)
+    for i, s in enumerate(segs):
+        if not s.Select4(i > 0, None):
+            for s2 in segs:
+                _discard_segment(drw, md, disp, s2)
+            raise ExtError("Could not select the contour after drawing it")
+
+    before = _broken_out_names(md, fname)
+    ok = drw.CreateBreakOutSection(depth_mm / 1000.0)
+    md.ClearSelection2(True)
+    new = _broken_out_names(md, fname) - before
+    if not ok or not new:
+        for s in segs:
+            _discard_segment(drw, md, disp, s)
+        raise ExtError(f"CreateBreakOutSection({fnum(depth_mm)}mm) returned {ok!r}, no new "
+                       f"feature -- check the contour encloses part of '{disp}' "
+                       f"({_outline_mm(view)}) and depth stays inside the part")
+    how = "given" if depth not in (None, "", 0) else "half the part depth along the view"
+    return _ok(f"Added {', '.join(sorted(new))} to '{disp}'"
+               + (f" ({fname})" if fname != disp else "")
+               + f" | depth {fnum(depth_mm)}mm ({how}) | contour {len(poly)} pts, sheet mm")
+
+
 def _all_view_names(drw) -> List[str]:
     """Every real view on the sheet (GetFirstView is the sheet itself -- skipped)."""
     v = drw.GetFirstView()
@@ -2711,6 +2829,7 @@ HANDLERS = {
     "add_drawing_view": t_add_drawing_view,
     "add_section_view": t_add_section_view,
     "add_detail_view": t_add_detail_view,
+    "add_broken_out_section": t_add_broken_out_section,
     "insert_model_dimensions": t_insert_model_dimensions,
     "add_note": t_add_note,
     "export_pdf": t_export_pdf,
@@ -2975,6 +3094,17 @@ TOOL_SCHEMAS = [
                                       "scale_with_model, partial, display_surface_cut, "
                                       "exclude_fasteners, cut_surface_bodies"}},
           ["source_view", "x1", "y1", "x2", "y2", "x", "y"])),
+    ("add_broken_out_section",
+     "Broken-out section on an existing drawing view. Default = the way to section a body of "
+     "revolution: ONE side view + a contour around the whole view + depth = half the part's "
+     "extent along the view direction (= outer radius), giving a full hatched section with no end "
+     "view, section line or label. points = custom closed contour, sheet mm. depth = model mm from "
+     "the nearest point of the part.",
+     _obj({"view": {"type": "string", "description": "View display or feature name, e.g. 'Drawing View1'"},
+           "depth": {"type": "number", "description": "mm (model); omit = half the part depth along the view"},
+           "points": {"type": "string", "description": "JSON [[x,y],...] closed contour in sheet mm; omit = view outline + margin"},
+           "margin": {"type": "number", "default": 2, "description": "mm around the view outline for the default contour"}},
+          ["view"])),
     ("add_detail_view",
      "Magnify a circular area of an existing drawing view into its own detail view. source_view "
      "must already be on the sheet. x,y,radius = the circle to magnify (sheet mm, on source_view); "
