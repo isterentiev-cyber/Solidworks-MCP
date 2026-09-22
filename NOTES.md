@@ -767,6 +767,129 @@ AutoSelectComponents, PropagateFeatureToParts)`. `-1` в Value **не**
 Это нормально; торец проверять по площади кольца (1×45 на Ø21.3 → кольцо до
 Ø19.3).
 
+## Чертежи (IDrawingDoc): виды и аннотации
+
+Живая сессия 2026-09-22 (SW 2026, чертёж ГОСТ, `kolco-flanec-1230.SLDDRW`) +
+перепроверка в тот же день на черновом чертеже из `data\templates\gost.drwdot`.
+Тулы: `add_section_view`, `add_detail_view`, `move_drawing_view`,
+`delete_drawing_view`, `add_drawing_dimension`, `add_gtol`, `add_datum`,
+`add_surface_finish`, `delete_annotation`. Находки по `insert_model_dimensions`
+и `add_note` — в докстрингах этих тулов в `ext.py`.
+
+### Координаты: лист ≠ эскиз вида
+
+- **Эскиз вида ≠ координаты листа.** После `ActivateView(вид)`
+  `SketchManager.CreateLine/CreateCircle` рисуют в эскизе вида: масштаб
+  модели (лист / масштаб вида), начало — `IView.Position` (центр вида).
+  Раньше `add_section_view` передавал мм листа напрямую → разрез косой и
+  мимо центра. **Центр вида ≠ проекция начала модели** в общем случае: у
+  несимметричного кольца (Front, 1:5) Position был на x=150, начало модели
+  на x=119. Совпадают они только у симметричной детали, отсюда и
+  впечатление «координаты от начала модели».
+- Точное преобразование — `ISketch.ModelToSketchTransform` у
+  `IView.GetSketch()`: его «модель» — это лист, т.е. это ровно
+  лист(м) → эскиз вида(м), с масштабом (`a[12] = 1/scale`) и поворотом вида.
+  `ext.sheet_to_view_sketch` / `view_sketch_to_sheet` (офлайн-проверка в
+  `scripts/selftest.py`). Модель → лист: `IView.ModelToViewTransform`
+  (`ext.model_to_sheet`). Публичный API тулов — в мм листа.
+- `add_section_view` сверяет концы линии обратным преобразованием и ставит ⚠
+  при расхождении > 0.01 мм.
+
+### Удаление видов и сегментов эскиза вида
+
+- **Сегмент эскиза вида удаляется, только пока его вид активен.** Иначе
+  `Select4` → True, а `EditDelete`/`DeleteSelection2` молча ничего не
+  делают. (Поэтому прежний `_discard_segment` на ошибке ничего не убирал.)
+- **Удалённый разрез оставляет сироту**: линия сечения остаётся в
+  родительском виде (`GetSectionLineCount2` считает её,
+  `IDrSection.GetSectionView()` → None). Её удаление
+  (`SelectByID2("Section Line2", "SECTIONLINE")` — без `@вид`) возвращает
+  исходную секущую линию в эскиз родителя отдельным сегментом.
+  `delete_drawing_view` снимает все три.
+- **Имя вида для выбора ≠ отображаемое имя.** Разрез показан как
+  `Section View A-A` (`IView.Name` и `GetName2` — оба), а фича вида и
+  строки выбора аннотаций — `Drawing View3` (`RD1@Drawing View3`).
+  Соответствие — через подфичи листа (`DrSheet` →
+  `GetSpecificFeature2` = IView): `ext._view_feature_names`. Тулы принимают
+  любое из двух имён.
+- **`IView.Position = (x, y)` через типизированную обёртку тихо пишет
+  мусор**: (0.31, 0.2) → (0, 310) мм. Работает только
+  `VARIANT(VT_ARRAY|VT_R8, [x, y])` (`move_drawing_view`).
+
+### Выбор рёбер в виде
+
+- `IView.SelectEntity(ребро_модели, append)` выбирает **собственное IEdge
+  детали** в виде — без координат листа. Это основной путь (`_select_edges`:
+  ребро по индексу `list_edges` детали или по ближайшей точке `x,y,z`).
+- Выбор `SelectByID2("", "EDGE", x, y)` в точке листа: в живой сессии
+  промахивался по коротким рёбрам (1 мм на листе) при zoom-to-fit, помогал
+  `ViewZoomTo2` вокруг точки. При перепроверке тот же вызов вернул **вид**
+  (тип 12), а не ребро, даже с зумом ±5 мм и активным видом; точка на
+  силуэте, где проецируются два соосных круга, тоже неоднозначна. Поэтому
+  координатный выбор не используется. Цена: точку крепления выноски на
+  ребре выбирает SW (выноска gtol может уйти к дальнему концу ребра) —
+  положение самого символа задаётся явно.
+
+### Размеры
+
+- `IModelDoc2.AddDimension2(x, y, 0)` с выбранными рёбрами: 1 круговое →
+  диаметр, 2 → расстояние; точка текста решает горизонтальный/вертикальный.
+  Размер ведомый (`RD1`), ГОСТ оборачивает его в скобки →
+  `IDisplayDimension.ShowParenthesis = False`.
+- `IDimension.Value` — в единицах документа (в шаблоне с IPS было 2.7559
+  вместо 70), брать `SystemValue` (м).
+- Допуск: **`IDimensionTolerance.SetValues2` в чертеже → False** (оба
+  значения `WhichConfigurations`), старый `SetValues(min, max)` работает.
+  Тип: `swTolBILAT`=2, `swTolSYMMETRIC`=4, `swTolFIT`=7,
+  `swTolFITWITHTOL`=8; посадка — `SetFitValues(hole, shaft)`.
+- Префикс: `IDisplayDimension.SetText(1, '<MOD-DIAM>')`
+  (`swDimensionTextPrefix`=1, суффикс = 2).
+
+### Допуски формы (IGtol)
+
+- `SetFrameSymbols2(Frame, GCS, …)`: **GCS — строка** (typelib `VT_BSTR`),
+  имя символа из `C:\ProgramData\SOLIDWORKS\SOLIDWORKS 2026\lang\english\gtol.sym`:
+  `<IGTOL-SRUN>`, `<IGTOL-TRUN>`, `<IGTOL-CYL>`, `<IGTOL-PARA>`… (раздел
+  `#IGTOL`; `#GGTOL` — ГОСТ-набор, те же имена + AXIS, LONG). int 25 рисуется
+  литералом «25». Значения — `SetFrameValues2(1, tol, '', datum, '', '')`.
+- `GetFormat()`: **1 = `GTOL_SW2021` (старый), 2 = `GTOL_SW2022`**. Свежий
+  `InsertGtol` — формат 1, и он полностью рабочий. `ConvertFormat()` → 2.
+- **Порядок важен:** символ + значения → потом `ConvertFormat()` — всё
+  сохраняется (так выглядят рамки на `kolco-flanec-1230`: формат 2,
+  значения на месте). `ConvertFormat()` первым → символ встаёт, а значение
+  допуска теряется (`GetFrameValues` → None) или `SetFrameValues2` падает с
+  «The server threw an exception»: хэндл после конвертации протухает.
+  Перечитывать через `IView.GetFirstGTOL()`/`GetNextGTOL()` по имени
+  аннотации.
+
+### Шероховатость (ISFSymbol)
+
+- `InsertSurfaceFinishSymbol3(... MaxRoughness ...)` кладёт значение в
+  слот 5. **Какие слоты рисуются, решает стандарт шероховатости документа**
+  `swDetailingSFSymbolStandard` (pref 629), а не стандарт оформления (ГОСТ у
+  обоих проверенных чертежей):
+
+  | pref 629 | стандарт | рисуются слоты |
+  |---|---|---|
+  | 0 | ISO 1302:1992 (дефолт шаблона `gost.drwdot`) | 1–7 → значение в **5** |
+  | 1 | ISO 1302:2002 | 1, 2, 8, 9, 10 → **8** |
+  | 2 | ISO 21920-1 (`kolco-flanec-1230`) | 2, 8, 9, 10 → **8** |
+
+  Слот 8 = `swSFSymbolRoughnessValue1`: `SetText(8, 'Ra 3,2')`. Текст в
+  нерисуемом слоте хранится и читается `GetText` без ошибок — видно только
+  на картинке; `GetTextCount`/`GetTextAtIndex` возвращают 0 и для
+  нарисованных, как сигнал не годятся. `add_surface_finish` выбирает слот
+  по pref 629.
+- Символ **без выноски** игнорирует LocX/LocY и встаёт в (0,0) —
+  двигать `IAnnotation.SetPosition2` после вставки.
+
+### Удаление аннотаций
+
+- `IAnnotation.Select3` → False для размеров и баз в виде чертежа.
+  Работает `Extension.SelectByID2('<имя>@<имя ФИЧИ вида>', тип)` +
+  `DeleteSelection2`; типы `DIMENSION`, `DATUMTAG`, `GTOL`, `SFSYMBOL`,
+  `NOTE` (`delete_annotation`).
+
 ## Известные открытые вопросы
 
 - Feature `GetTypeName2` иногда возвращает нестандартные имена — например

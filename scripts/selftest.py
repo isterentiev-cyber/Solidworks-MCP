@@ -25,6 +25,31 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
+def _check_view_sketch_math(ext):
+    """Sheet mm <-> drawing-view sketch coordinates (add_section_view /
+    add_detail_view). The ArrayData below is the view sketch's
+    ModelToSketchTransform read live on 2026-09-22 from a 1:5 Front view
+    placed at sheet (150,200) mm: sketch = (sheet - Position) / scale."""
+    bad = []
+    front = [1, 0, 0, 0, 1, 0, 0, 0, 1, -0.75, -1.0, 0.0, 5.0, 0, 0, 0]
+    cases = [((150, 200), (0.0, 0.0)),        # view centre -> sketch origin
+             ((150, 340), (0.0, 0.7)),        # +140 sheet mm -> +700 model mm
+             ((119, 200), (-0.155, 0.0))]
+    for sheet, want in cases:
+        got = ext.sheet_to_view_sketch(front, *sheet)
+        if max(abs(got[0] - want[0]), abs(got[1] - want[1])) > 1e-9:
+            bad.append(f"sheet_to_view_sketch{sheet} = {got}, want {want}")
+    # a rotated (30 deg) and scaled view must round-trip too
+    c, s = 0.8660254037844387, 0.5
+    rot = [c, s, 0, -s, c, 0, 0, 0, 1, 0.12, -0.34, 0.0, 2.0, 0, 0, 0]
+    for sheet in ((0, 0), (150, 200), (-40.5, 610)):
+        sk = ext.sheet_to_view_sketch(rot, *sheet)
+        back = ext.view_sketch_to_sheet(rot, *sk)
+        if max(abs(back[0] - sheet[0]), abs(back[1] - sheet[1])) > 1e-9:
+            bad.append(f"view sketch round trip {sheet} -> {sk} -> {back}")
+    return bad
+
+
 def main():
     problems = []
     notes = []
@@ -77,6 +102,8 @@ def main():
         for req in schema.get("required", []):
             if req not in (schema.get("properties") or {}):
                 problems.append(f"{t.name}: required '{req}' is not among its properties")
+
+    problems += _check_view_sketch_math(ext)
 
     print(f"tools served: {len(tools)}")
     print(f"  ext handlers: {len(ext.HANDLERS)}   ext schemas: {len(ext.TOOL_SCHEMAS)}")

@@ -104,6 +104,24 @@ TOOLSETS: Dict[str, Set[str]] = {
         "mass_properties",
         "get_rebuild_errors",
     },
+    # Drawing documents: sheets, views and annotations of a saved part/assembly.
+    "drawings": {
+        "create_drawing",
+        "add_standard_views",
+        "add_drawing_view",
+        "add_section_view",
+        "add_detail_view",
+        "insert_model_dimensions",
+        "add_note",
+        "export_pdf",
+        "move_drawing_view",
+        "delete_drawing_view",
+        "add_drawing_dimension",
+        "add_gtol",
+        "add_datum",
+        "add_surface_finish",
+        "delete_annotation",
+    },
 }
 
 ALWAYS_ON = "core"

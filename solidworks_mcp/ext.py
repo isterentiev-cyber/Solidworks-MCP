@@ -17,6 +17,8 @@ Design rules (see CLAUDE.md / NOTES.md):
 """
 
 import math
+import os
+import tempfile
 import time
 import types
 import logging
@@ -27,6 +29,7 @@ import pythoncom
 import win32com.client
 
 from .utils.typelib import get_sw_module, get_constant, get_const_module
+from .utils.sw_finder import find_template
 
 logger = logging.getLogger(__name__)
 
@@ -1757,6 +1760,926 @@ def t_edit_feature(app, args):
     return _ok(msg)
 
 
+# ============================================================================
+# Drawings
+# ============================================================================
+
+# GetUserPreferenceStringValue index for the drawing template's own default,
+# same empirical constant as SolidWorksAutomation._TEMPLATE_PREF_INDEX in
+# automation/base.py (part=8, assembly=9, drawing=10) -- duplicated here
+# because that method hangs off `self`, not off the bare `app` this module
+# gets from ext.dispatch().
+_DRAWING_TEMPLATE_PREF_INDEX = 10
+
+_STANDARD_VIEW_METHODS = {"third": "Create3rdAngleViews2", "first": "Create1stAngleViews2"}
+
+
+def drawing(app):
+    """Active document as typed IDrawingDoc (raises ExtError if it isn't one)."""
+    md = model(app)
+    if md.GetType() != 3:
+        raise ExtError(f"Active document '{md.GetTitle()}' is not a drawing "
+                       f"(create_drawing / open a .slddrw first)")
+    return T(md, "IDrawingDoc")
+
+
+def _drawing_template(app) -> Optional[str]:
+    """Same resolution order as SolidWorksAutomation._get_template('drawing'):
+    disk search first, then the live app's own configured default."""
+    tmpl = find_template("drawing")
+    if tmpl and os.path.exists(tmpl):
+        return tmpl
+    try:
+        cand = app.GetUserPreferenceStringValue(_DRAWING_TEMPLATE_PREF_INDEX)
+        if cand and os.path.exists(cand):
+            return cand
+    except Exception as e:
+        logger.debug(f"GetUserPreferenceStringValue(drawing) failed: {e}")
+    return None
+
+
+def _resolve_view_name(view: str) -> str:
+    """'front' / 'Front' / '*Front' -> '*Front' (the form CreateDrawViewFromModelView3
+    wants). 'current' keeps the model's last-active orientation."""
+    v = str(view or "current").strip()
+    if v.startswith("*"):
+        return v
+    return "*" + v[:1].upper() + v[1:].lower()
+
+
+def t_create_drawing(app, args):
+    tmpl = _drawing_template(app)
+    if not tmpl:
+        raise ExtError(
+            "No drawing template found (disk search and the running app's own "
+            "default template preference both came up empty). Set a default "
+            "drawing template in SolidWorks Options > Default Templates.")
+    doc = app.NewDocument(tmpl, 0, 0, 0)
+    if doc is None:
+        raise ExtError("NewDocument returned None for the drawing template")
+    md = T(doc, "IModelDoc2")
+    drw = T(doc, "IDrawingDoc")
+    return _ok(f"Created drawing: {md.GetTitle()} | sheets {drw.GetSheetCount()}")
+
+
+def t_add_standard_views(app, args):
+    drw = drawing(app)
+    path = str(args["model_path"])
+    if not os.path.exists(path):
+        raise ExtError(f"Model file not found: {path}")
+    projection = str(args.get("projection", "third")).strip().lower()
+    method_name = _STANDARD_VIEW_METHODS.get(projection)
+    if method_name is None:
+        raise ExtError(f"Unknown projection '{projection}' (use 'first' or 'third')")
+    before = drw.GetViewCount()
+    ok = getattr(drw, method_name)(path)
+    if not ok:
+        raise ExtError(f"{method_name} returned False for {path} "
+                       f"-- check the path and that the model rebuilds cleanly")
+    after = drw.GetViewCount()
+    return _ok(f"{projection}-angle standard views from {os.path.basename(path)} "
+               f"| views {before}->{after}")
+
+
+def t_add_drawing_view(app, args):
+    drw = drawing(app)
+    path = str(args["model_path"])
+    if not os.path.exists(path):
+        raise ExtError(f"Model file not found: {path}")
+    view_name = _resolve_view_name(args.get("view"))
+    x = float(args.get("x", 100)) / 1000.0
+    y = float(args.get("y", 100)) / 1000.0
+    before = drw.GetViewCount()
+    view = drw.CreateDrawViewFromModelView3(path, view_name, x, y, 0.0)
+    if view is None:
+        raise ExtError(
+            f"CreateDrawViewFromModelView3 failed for view '{view_name}' of "
+            f"{os.path.basename(path)} -- check the name (Front/Top/Right/Left/"
+            f"Back/Bottom/Isometric/Dimetric/Trimetric/Current) and that the "
+            f"model rebuilds cleanly")
+    after = drw.GetViewCount()
+    iview = T(view, "IView")
+    scale = args.get("scale")
+    if scale:
+        iview.ScaleDecimal = float(scale)
+    return _ok(f"Added view {iview.GetName2()!r} ({view_name}) at "
+               f"({fnum(x*1000)},{fnum(y*1000)})mm | views {before}->{after}")
+
+
+# CreateSectionViewAt5's Options bitmask (confirmed via swapi against this
+# install's typelib -- swCreateSectionView_* constants).
+_SECTION_VIEW_FLAGS = {
+    "not_aligned": 1, "offset": 2, "change_direction": 4, "scale_with_model": 8,
+    "partial": 16, "display_surface_cut": 32, "exclude_fasteners": 64,
+    "cut_surface_bodies": 128,
+}
+
+# CreateDetailViewAt4's Style param (swDetView* constants).
+_DETAIL_VIEW_STYLES = {"standard": 0, "broken": 1, "leader": 2, "noleader": 3, "connected": 4}
+
+
+def _activate_view(drw, name: str):
+    """ActivateView + the now-active IView (drw.ActiveDrawingView)."""
+    if not drw.ActivateView(name):
+        raise ExtError(f"View '{name}' not found on the active sheet "
+                       f"(name is as reported by add_drawing_view/add_standard_views, "
+                       f"e.g. 'Drawing View1')")
+    view = drw.ActiveDrawingView
+    if view is None:
+        raise ExtError(f"ActivateView('{name}') succeeded but ActiveDrawingView is None")
+    return T(view, "IView")
+
+
+def _view_sketch_xform(view) -> List[float]:
+    """ArrayData of SHEET (m) -> the view's own sketch space (m).
+
+    Anything SketchManager.Create* draws while a view is active lands in that
+    view's sketch, whose coordinates are NOT sheet coordinates: they are
+    model-scale (sheet / view scale), with the origin at IView.Position (the
+    view centre) -- confirmed live 2026-09-22. That is NOT generally the model
+    origin's projection: a 1:5 Front view of an asymmetric ring had its
+    Position at sheet x=150 and the model origin at x=119. The view sketch's
+    ISketch.ModelToSketchTransform is exactly this sheet->sketch map (its
+    'model' is the drawing sheet), scale and view rotation included, so no
+    hand-rolled Position/ScaleDecimal math."""
+    sk = view.GetSketch()
+    if sk is None:
+        raise ExtError(f"View '{view.GetName2()}' has no sketch")
+    return list(T(T(sk, "ISketch").ModelToSketchTransform, "IMathTransform").ArrayData)
+
+
+def sheet_to_view_sketch(a, x_mm: float, y_mm: float) -> List[float]:
+    """Sheet mm -> view sketch metres, given _view_sketch_xform's ArrayData."""
+    p = xform(a, [x_mm / 1000.0, y_mm / 1000.0, 0.0])
+    return [p[0], p[1]]
+
+
+def view_sketch_to_sheet(a, x_m: float, y_m: float) -> List[float]:
+    """Inverse of sheet_to_view_sketch: view sketch metres -> sheet mm.
+    Pure math on the ArrayData (rotation + uniform scale + shift), so
+    selftest.py can check the pair offline."""
+    s = a[12] if len(a) > 12 and a[12] else 1.0
+    q = [(x_m - a[9]) / s, (y_m - a[10]) / s, (0.0 - a[11]) / s]
+    # p' = (p·R)*s + t  =>  p = ((p'-t)/s)·R^T, i.e. p_i = sum_j R[i][j] q_j
+    p = [sum(a[3 * i + j] * q[j] for j in range(3)) for i in range(3)]
+    return [p[0] * 1000.0, p[1] * 1000.0]
+
+
+def model_to_sheet(view, p_mm) -> List[float]:
+    """Model point (mm, in the referenced part/assembly's own frame) -> sheet
+    mm, via IView.ModelToViewTransform (whose 'view' space is sheet metres)."""
+    a = list(T(view.ModelToViewTransform, "IMathTransform").ArrayData)
+    p = xform(a, [c / 1000.0 for c in p_mm])
+    return [p[0] * 1000.0, p[1] * 1000.0]
+
+
+def _sketch_line_sheet(view, sm, x1, y1, x2, y2):
+    """A cutting line for section views, given in SHEET mm, drawn into the
+    active view's sketch (see _view_sketch_xform for why this converts).
+    Returns (segment, worst round-trip error in sheet mm)."""
+    a = _view_sketch_xform(view)
+    s1, s2 = sheet_to_view_sketch(a, x1, y1), sheet_to_view_sketch(a, x2, y2)
+    with NoInference(sm):
+        line = sm.CreateLine(s1[0], s1[1], 0.0, s2[0], s2[1], 0.0)
+    if line is None:
+        raise ExtError("CreateLine returned None for the section cutting line")
+    sl = T(line, "ISketchLine")
+    err = 0.0
+    for pt, want in ((sl.GetStartPoint2(), (x1, y1)), (sl.GetEndPoint2(), (x2, y2))):
+        sp = T(pt, "ISketchPoint")
+        got = view_sketch_to_sheet(a, sp.X, sp.Y)
+        err = max(err, math.hypot(got[0] - want[0], got[1] - want[1]))
+    return T(line, "ISketchSegment"), err
+
+
+def _sketch_circle_sheet(view, sm, x, y, r):
+    """A detail-view boundary circle given in SHEET mm (centre + radius),
+    drawn into the active view's sketch. CreateCircle silently returns None
+    without the NoInference (AddToDB/AutoInference) bracket -- see NOTES.md."""
+    a = _view_sketch_xform(view)
+    c = sheet_to_view_sketch(a, x, y)
+    e = sheet_to_view_sketch(a, x + r, y)
+    with NoInference(sm):
+        circ = sm.CreateCircle(c[0], c[1], 0.0, e[0], e[1], 0.0)
+    if circ is None:
+        raise ExtError("CreateCircle returned None for the detail-view circle")
+    return T(circ, "ISketchSegment")
+
+
+def _discard_segment(drw, md, view_name, seg):
+    """Best-effort cleanup of the marker line/circle when view creation fails,
+    so a failed call does not litter the sheet. A view-sketch segment only
+    deletes while ITS view is active -- otherwise Select4 still returns True
+    but EditDelete/DeleteSelection2 silently do nothing (confirmed live
+    2026-09-22). Failure here must not mask the original error, so it is
+    swallowed."""
+    try:
+        drw.ActivateView(view_name)
+        md.ClearSelection2(True)
+        seg.Select4(False, None)
+        T(md.Extension, "IModelDocExtension").DeleteSelection2(0)
+    except Exception:
+        pass
+
+
+def _outline_mm(view) -> str:
+    o = view.GetOutline()
+    return f"x {fnum(o[0]*1000)}..{fnum(o[2]*1000)}, y {fnum(o[1]*1000)}..{fnum(o[3]*1000)} mm"
+
+
+def t_add_section_view(app, args):
+    """CreateSectionViewAt5 does not build its own cutting plane from X,Y,Z as
+    the name suggests -- confirmed live (2026-09-22): with nothing selected it
+    returns None and adds no view. It needs a construction line, drawn ON THE
+    ACTIVE VIEW (ActivateView first, same requirement as detail views) and
+    selected, and X,Y,Z is only WHERE THE RESULTING SECTION VIEW LANDS on the
+    sheet -- unrelated to the line's own position.
+
+    The line itself lives in the active view's SKETCH space, not sheet space
+    (fixed 2026-09-22: sheet mm used to be passed straight to CreateLine,
+    which cut skewed and off-centre). The public API stays in sheet mm and
+    _sketch_line_sheet converts."""
+    drw = drawing(app)
+    md = model(app)
+    source = str(args["source_view"])
+    view = _activate_view(drw, source)
+    sm = T(md.SketchManager, "ISketchManager")
+    x1, y1, x2, y2 = (float(args[k]) for k in ("x1", "y1", "x2", "y2"))
+
+    flags = 0
+    for name in parse_names(args.get("options", "")):
+        bit = _SECTION_VIEW_FLAGS.get(name)
+        if bit is None:
+            raise ExtError(f"Unknown section option '{name}' (have: {sorted(_SECTION_VIEW_FLAGS)})")
+        flags |= bit
+
+    seg, err = _sketch_line_sheet(view, sm, x1, y1, x2, y2)
+    md.ClearSelection2(True)
+    if not seg.Select4(False, None):
+        _discard_segment(drw, md, source, seg)
+        raise ExtError("Could not select the cutting line after drawing it")
+
+    px, py = float(args["x"]) / 1000.0, float(args["y"]) / 1000.0
+    label = str(args.get("label", ""))
+    depth = float(args.get("depth", 0)) / 1000.0
+    before = drw.GetViewCount()
+    try:
+        new = drw.CreateSectionViewAt5(px, py, 0.0, label, flags, None, depth)
+    except Exception:
+        _discard_segment(drw, md, source, seg)
+        raise
+    if new is None:
+        _discard_segment(drw, md, source, seg)
+        raise ExtError(f"CreateSectionViewAt5 failed -- check that the line actually "
+                       f"crosses '{source}' (x1,y1,x2,y2 are sheet mm, same space as "
+                       f"add_drawing_view's x,y; the view spans {_outline_mm(view)})")
+    after = drw.GetViewCount()
+    iview = T(new, "IView")
+    warn = f" | ⚠ line landed {fnum(err, 3)}mm off the requested sheet points" if err > 0.01 else ""
+    return _ok(f"Added section view {iview.GetName2()!r} through "
+               f"({fnum(x1)},{fnum(y1)})-({fnum(x2)},{fnum(y2)})mm sheet "
+               f"of '{source}' | views {before}->{after}{warn}")
+
+
+def t_add_detail_view(app, args):
+    """CreateDetailViewAt4 needs the same ActivateView + pre-drawn/selected
+    marker pattern as section views (a circle here, confirmed live 2026-09-22),
+    and the same sheet -> view-sketch conversion for the circle.
+    LabelIn is a STRING (the letter, '' = auto-next), not a boolean -- passing
+    True/False there silently stamps the literal text 'True'/'False' as the
+    label with no error, which is what a naive port of the signature's
+    (bool-looking) position would do."""
+    drw = drawing(app)
+    md = model(app)
+    source = str(args["source_view"])
+    style = _DETAIL_VIEW_STYLES.get(str(args.get("style", "standard")).strip().lower())
+    if style is None:
+        raise ExtError(f"Unknown style '{args.get('style')}' (have: {sorted(_DETAIL_VIEW_STYLES)})")
+    view = _activate_view(drw, source)
+    sm = T(md.SketchManager, "ISketchManager")
+    seg = _sketch_circle_sheet(view, sm, float(args["x"]), float(args["y"]), float(args["radius"]))
+    md.ClearSelection2(True)
+    if not seg.Select4(False, None):
+        _discard_segment(drw, md, source, seg)
+        raise ExtError("Could not select the detail circle after drawing it")
+
+    scale = float(args.get("scale", 2.0))
+    px, py = float(args["place_x"]) / 1000.0, float(args["place_y"]) / 1000.0
+    label = str(args.get("label", ""))
+
+    before = drw.GetViewCount()
+    try:
+        new = drw.CreateDetailViewAt4(
+            px, py, 0.0, style, scale, 1.0, label, 0,
+            bool(args.get("full_outline", True)),
+            bool(args.get("jagged_outline", False)),
+            bool(args.get("no_outline", False)),
+            int(args.get("shape_intensity", 1)))
+    except Exception:
+        _discard_segment(drw, md, source, seg)
+        raise
+    if new is None:
+        _discard_segment(drw, md, source, seg)
+        raise ExtError(f"CreateDetailViewAt4 failed -- check that "
+                       f"({fnum(args['x'])},{fnum(args['y'])})mm r={fnum(args['radius'])}mm "
+                       f"actually falls on '{source}' ({_outline_mm(view)})")
+    after = drw.GetViewCount()
+    iview = T(new, "IView")
+    return _ok(f"Added detail view {iview.GetName2()!r} of "
+               f"({fnum(args['x'])},{fnum(args['y'])})mm r={fnum(args['radius'])}mm on "
+               f"'{source}' at {fnum(scale)}:1 | views {before}->{after}")
+
+
+def _all_view_names(drw) -> List[str]:
+    """Every real view on the sheet (GetFirstView is the sheet itself -- skipped)."""
+    v = drw.GetFirstView()
+    if v is None:
+        return []
+    v = T(v, "IView").GetNextView()
+    names = []
+    while v is not None:
+        vt = T(v, "IView")
+        names.append(vt.Name)
+        v = vt.GetNextView()
+    return names
+
+
+def _force_view_render(md):
+    """Freshly-placed views (straight after add_standard_views/add_drawing_view)
+    silently starve InsertModelDimensions until SolidWorks actually renders
+    them. Confirmed live 2026-09-22 by elimination -- none of these fixed it:
+    waiting up to ~7s across repeated select+call retries; ForceRebuild3;
+    GraphicsRedraw2 + ViewZoomtofit2; switching ActiveDoc to a different open
+    document and back. What DID fix it, reliably, every time: calling the
+    capture_view tool (SaveBMP) in between. So this forces that same render
+    side effect directly -- a throwaway bitmap, written and discarded, only
+    for the render it forces."""
+    fd, path = tempfile.mkstemp(suffix=".bmp")
+    os.close(fd)
+    try:
+        md.SaveBMP(path, 200, 200)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def t_insert_model_dimensions(app, args):
+    """InsertModelDimensions(Option) pulls dimensions only into whatever
+    view(s) are SELECTED at call time (SelectByID2, kind='DRAWINGVIEW') --
+    ActivateView alone inserts nothing, confirmed live 2026-09-22 (several
+    Option values tried against an activated-but-unselected view, all
+    silent no-ops). Each selected view only gets the dimensions native to
+    geometry actually visible from it -- a feature whose defining geometry
+    isn't shown edge-on in any placed view (e.g. this install's test hole,
+    always seen as a centre mark, never its round profile) will not appear
+    regardless of Option or how many views are selected. See
+    _force_view_render for the freshly-placed-view starvation issue this
+    also works around."""
+    drw = drawing(app)
+    md = model(app)
+    ext_ = T(md.Extension, "IModelDocExtension")
+    names = parse_names(args.get("views", ""))
+    if not names:
+        names = _all_view_names(drw)
+    if not names:
+        raise ExtError("No views on the active sheet (add_drawing_view/add_standard_views first)")
+    option = int(args.get("option", 0))
+
+    _force_view_render(md)
+    md.ClearSelection2(True)
+    for i, name in enumerate(names):
+        if not ext_.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, i > 0, 0, None, 0):
+            raise ExtError(f"View '{name}' not found on the active sheet")
+    drw.InsertModelDimensions(option)  # void return -- no success signal from the API itself
+    md.ClearSelection2(True)
+    return _ok(f"Inserted model dimensions into {len(names)} view(s): {', '.join(names)} "
+              f"(InsertModelDimensions gives no success signal -- verify with capture_view)")
+
+
+def t_add_note(app, args):
+    """IDrawingDoc.NewNote / InsertNewNote2 are void-return UI-command
+    wrappers that arm the 'place a note' cursor for a mouse click that never
+    comes when called headlessly -- confirmed live 2026-09-22: no object, no
+    new selection, nothing added to the sheet, and no error either.
+    IModelDoc2.InsertNote(Text) is the one that actually returns an INote;
+    position it via its IAnnotation.SetPosition (metres). A position outside
+    the sheet's own paper bounds still shows on screen (zoom-to-fit expands
+    to include it) but is cropped out of a PDF export -- keep x,y within the
+    sheet's paper size."""
+    md = model(app)
+    if md.GetType() != 3:
+        raise ExtError(f"Active document '{md.GetTitle()}' is not a drawing")
+    text = str(args["text"])
+    n = md.InsertNote(text)
+    if n is None:
+        raise ExtError("InsertNote returned None")
+    note = T(n, "INote")
+    ann = T(note.GetAnnotation(), "IAnnotation")
+    x, y = float(args.get("x", 100)) / 1000.0, float(args.get("y", 100)) / 1000.0
+    ann.SetPosition(x, y, 0.0)
+    height = args.get("height")
+    if height:
+        note.SetHeight(float(height) / 1000.0)
+    return _ok(f"Added note {note.GetName()!r} at ({fnum(x*1000)},{fnum(y*1000)})mm: {text[:60]!r}")
+
+
+def t_export_pdf(app, args):
+    md = model(app)
+    if md.GetType() != 3:
+        raise ExtError(f"Active document '{md.GetTitle()}' is not a drawing")
+    path = str(args["path"])
+    if not path.lower().endswith(".pdf"):
+        raise ExtError("path must end in .pdf")
+    out_dir = os.path.dirname(path)
+    if out_dir and not os.path.isdir(out_dir):
+        raise ExtError(f"Directory does not exist: {out_dir}")
+    ok = md.SaveAs(path)
+    if not ok or not os.path.exists(path):
+        raise ExtError(f"SaveAs returned {ok!r}, file "
+                       f"{'exists' if os.path.exists(path) else 'was not created'}")
+    return _ok(f"Exported PDF: {path} ({os.path.getsize(path)} bytes)")
+
+
+# ----------------------------------------------------------------------------
+# Drawing views: lookup, move, delete
+# ----------------------------------------------------------------------------
+
+def _views(drw) -> list:
+    """Every real view on the active sheet as typed IView (the sheet itself,
+    GetFirstView, skipped)."""
+    out = []
+    first = drw.GetFirstView()
+    n = T(first, "IView").GetNextView() if first is not None else None
+    while n is not None:
+        vt = T(n, "IView")
+        out.append(vt)
+        n = vt.GetNextView()
+    return out
+
+
+def _view_feature_names(md) -> Dict[str, str]:
+    """{view display name: view FEATURE name}. They differ for derived views:
+    a section view shows as 'Section View A-A' (IView.GetName2/Name) while its
+    feature -- the name annotation selection strings need, 'RD1@Drawing View3'
+    -- is 'Drawing View3' (confirmed live 2026-09-22). Read off the sheet
+    feature's subfeatures, whose GetSpecificFeature2 is the IView."""
+    out = {}
+    f = md.FirstFeature()
+    while f is not None:
+        ff = T(f, "IFeature")
+        if ff.GetTypeName2() == "DrSheet":
+            sub = ff.GetFirstSubFeature()
+            while sub is not None:
+                sf = T(sub, "IFeature")
+                spec = sf.GetSpecificFeature2()
+                if spec is not None:
+                    try:
+                        out[T(spec, "IView").GetName2()] = sf.Name
+                    except Exception:
+                        pass  # not a view (Sketch1, Plane1, Detail Folder...)
+                sub = sf.GetNextSubFeature()
+        f = ff.GetNextFeature()
+    return out
+
+
+def _find_view(drw, md, name: str):
+    """(IView, feature name) by display OR feature name."""
+    fnames = _view_feature_names(md)
+    for vw in _views(drw):
+        disp = vw.GetName2()
+        if name in (disp, fnames.get(disp)):
+            return vw, fnames.get(disp, disp)
+    have = ", ".join(f"{d!r}" + (f" (={fnames[d]!r})" if fnames.get(d, d) != d else "")
+                     for d in (vw.GetName2() for vw in _views(drw)))
+    raise ExtError(f"No view '{name}' on the active sheet (have: {have or 'none'})")
+
+
+def t_move_drawing_view(app, args):
+    """IView.Position must be a VARIANT(VT_ARRAY|VT_R8): a plain tuple through
+    the typed wrapper is accepted without error and sets garbage -- (0.31,0.2)
+    came back as (0, 310) mm, confirmed live 2026-09-22."""
+    drw = drawing(app)
+    md = model(app)
+    view, _ = _find_view(drw, md, str(args["view"]))
+    x, y = float(args["x"]), float(args["y"])
+    before = [p * 1000 for p in view.Position]
+    view.Position = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                                            [x / 1000.0, y / 1000.0])
+    after = [p * 1000 for p in view.Position]
+    warn = ""
+    if abs(after[0] - x) > 0.01 or abs(after[1] - y) > 0.01:
+        warn = " | ⚠ position did not take (aligned views are locked to their parent's axis)"
+    return _ok(f"Moved '{view.GetName2()}' ({fnum(before[0])},{fnum(before[1])}) -> "
+               f"({fnum(after[0])},{fnum(after[1])})mm{warn}")
+
+
+def _segment_names(view) -> set:
+    sk = view.GetSketch()
+    segs = T(sk, "ISketch").GetSketchSegments() if sk is not None else None
+    return {T(s, "ISketchSegment").GetName() for s in (segs or ())}
+
+
+def t_delete_drawing_view(app, args):
+    """Deleting a section view leaves its section line in the parent view as
+    an orphan (GetSectionLineCount2 still counts it, IDrSection.GetSectionView
+    -> None). Deleting that line (SelectByID2(name, 'SECTIONLINE')) in turn
+    hands the original cutting line back to the parent view's sketch as a
+    loose segment -- all confirmed live 2026-09-22. This removes all three."""
+    drw = drawing(app)
+    md = model(app)
+    ext_ = T(md.Extension, "IModelDocExtension")
+    view, fname = _find_view(drw, md, str(args["view"]))
+    disp = view.GetName2()
+
+    # section lines that belong to this view, per parent view, BEFORE deleting
+    owned = []  # (parent IView, parent display name, section line name)
+    for pv in _views(drw):
+        for s in pv.GetSectionLines() or ():
+            ds = T(s, "IDrSection")
+            sv = ds.GetSectionView()
+            if sv is not None and T(sv, "IView").GetName2() == disp:
+                owned.append((pv, pv.GetName2(), ds.GetName()))
+
+    before = drw.GetViewCount()
+    md.ClearSelection2(True)
+    if not ext_.SelectByID2(fname, "DRAWINGVIEW", 0, 0, 0, False, 0, None, 0):
+        raise ExtError(f"Could not select view '{disp}' ({fname})")
+    if not ext_.DeleteSelection2(0):
+        raise ExtError(f"DeleteSelection2 refused view '{disp}'")
+    after = drw.GetViewCount()
+
+    notes = []
+    for pv, pname, lname in owned:
+        segs_before = _segment_names(pv)
+        md.ClearSelection2(True)
+        if not (ext_.SelectByID2(lname, "SECTIONLINE", 0, 0, 0, False, 0, None, 0)
+                and ext_.DeleteSelection2(0)):
+            notes.append(f"⚠ section line {lname!r} left in '{pname}'")
+            continue
+        loose = _segment_names(pv) - segs_before
+        if loose:
+            drw.ActivateView(pname)  # view-sketch segments only delete while their view is active
+            md.ClearSelection2(True)
+            sk = T(pv.GetSketch(), "ISketch")
+            for s in sk.GetSketchSegments() or ():
+                seg = T(s, "ISketchSegment")
+                if seg.GetName() in loose:
+                    seg.Select4(True, None)
+            ext_.DeleteSelection2(0)
+            left = _segment_names(pv) & loose
+            if left:
+                notes.append(f"⚠ cutting line {sorted(left)} left in '{pname}' sketch")
+        notes.append(f"removed section line {lname!r} + cutting line from '{pname}'")
+    md.ClearSelection2(True)
+    return _ok(f"Deleted view '{disp}'" + (f" ({fname})" if fname != disp else "")
+               + f" | views {before}->{after}" + "".join(f" | {n}" for n in notes))
+
+
+# ----------------------------------------------------------------------------
+# Drawing annotations: dimensions, gtol, datums, surface finish
+# ----------------------------------------------------------------------------
+
+def _ref_part(view):
+    ref = view.ReferencedDocument
+    if ref is None:
+        raise ExtError(f"View '{view.GetName2()}' has no referenced model")
+    rmd = T(ref, "IModelDoc2")
+    if not is_part(rmd):
+        raise ExtError(f"View '{view.GetName2()}' shows an assembly -- edge references "
+                       f"are only supported for part views")
+    return rmd
+
+
+def _resolve_edge(view, spec):
+    """An edge of the view's part, from either
+      - an index: '12' -- same numbering as list_edges on that part, or
+      - a model point: '0,155,615' (mm, part frame) -- nearest edge to it.
+    Returns (IEdge, point ON the edge in model mm)."""
+    rmd = _ref_part(view)
+    s = str(spec).strip()
+    if "," not in s:
+        idx = int(s)
+        rows = edge_rows(rmd)
+        if not 1 <= idx <= len(rows):
+            raise ExtError(f"edge index {idx} out of range 1..{len(rows)} "
+                           f"(list_edges on {rmd.GetTitle()})")
+        r = rows[idx - 1]
+        return r["obj"], [c * 1000 for c in r["mid"]]
+    p = [float(c) / 1000.0 for c in s.split(",")]
+    if len(p) != 3:
+        raise ExtError(f"edge point must be 'x,y,z' in model mm, got {spec!r}")
+    best = None
+    for b in bodies(rmd):
+        for eo in b.GetEdges() or ():
+            e = T(eo, "IEdge")
+            q = e.GetClosestPointOn(*p)[:3]
+            d = math.dist(p, q)
+            if best is None or d < best[0]:
+                best = (d, e, q)
+    if best is None:
+        raise ExtError(f"{rmd.GetTitle()} has no edges")
+    d, e, q = best
+    if d > 0.001:
+        logger.info(f"edge point {spec} is {d*1000:.2f}mm from the nearest edge")
+    return e, [c * 1000 for c in q]
+
+
+def _select_edges(md, view, specs) -> List[List[float]]:
+    """Select edges of a view by IView.SelectEntity(model edge) -- the model's
+    own IEdge, no sheet-coordinate picking. Picking with SelectByID2('EDGE') at
+    the edge's mapped sheet point misses short edges at zoom-to-fit (reported
+    2026-09-22); a live retest the same day got the VIEW back (type 12) even
+    after ViewZoomTo2 around the point, so picking is not used at all. The one
+    cost: SolidWorks, not the caller, picks where on the edge a leader lands.
+    Returns the model points (mm) on each edge."""
+    md.ClearSelection2(True)
+    pts = []
+    for i, spec in enumerate(specs):
+        e, p = _resolve_edge(view, spec)
+        if not view.SelectEntity(e, i > 0):
+            raise ExtError(f"IView.SelectEntity failed for edge {spec!r} in '{view.GetName2()}' "
+                           f"(is it visible in this view?)")
+        pts.append(p)
+    return pts
+
+
+def _place(ann, x, y):
+    if x is None or y is None:
+        return
+    if not T(ann, "IAnnotation").SetPosition2(float(x) / 1000.0, float(y) / 1000.0, 0.0):
+        raise ExtError("IAnnotation.SetPosition2 failed")
+
+
+def _ann_pos(ann) -> str:
+    p = T(ann, "IAnnotation").GetPosition()
+    return f"({fnum(p[0]*1000)},{fnum(p[1]*1000)})mm"
+
+
+def _default_text_pos(view, pts, off=10.0):
+    """Sheet mm point `off` mm above the midpoint of the picked model points."""
+    s = [model_to_sheet(view, p) for p in pts]
+    return (sum(q[0] for q in s) / len(s), max(q[1] for q in s) + off)
+
+
+def t_add_drawing_dimension(app, args):
+    """Driven dimension between one or two model edges in a drawing view.
+    One circular edge -> diameter/radius; two -> distance. Created via
+    IModelDoc2.AddDimension2 with the edges selected through
+    IView.SelectEntity; x,y (sheet mm) is the text position and also decides
+    horizontal/vertical/aligned, exactly like placing it by hand.
+
+    Tolerance, confirmed live 2026-09-22: IDimensionTolerance.SetValues2 returns
+    False in a drawing (both WhichConfigurations values); the older
+    SetValues(min, max) works. Fit: Type=swTolFIT(7) + SetFitValues(hole, shaft).
+    Drawing-made dimensions are driven (reference) and GOST wraps them in
+    parentheses -- parenthesis=False (default) clears ShowParenthesis."""
+    drw = drawing(app)
+    md = model(app)
+    view, _ = _find_view(drw, md, str(args["view"]))
+    specs = [s for s in (args.get("edge1"), args.get("edge2")) if s not in (None, "")]
+    if not specs:
+        raise ExtError("edge1 is required (edge index from list_edges on the part, or 'x,y,z' model mm)")
+    pts = _select_edges(md, view, specs)
+    x, y = args.get("x"), args.get("y")
+    if x is None or y is None:
+        x, y = _default_text_pos(view, pts)
+    dd = md.AddDimension2(float(x) / 1000.0, float(y) / 1000.0, 0.0)
+    md.ClearSelection2(True)
+    if dd is None:
+        raise ExtError(f"AddDimension2 returned None for edges {specs} in '{view.GetName2()}'")
+    D = T(dd, "IDisplayDimension")
+    dim = T(D.GetDimension2(0), "IDimension")
+
+    parts = []
+    prefix, suffix = args.get("prefix"), args.get("suffix")
+    if prefix:
+        D.SetText(1, str(prefix))  # swDimensionTextPrefix
+    if suffix:
+        D.SetText(2, str(suffix))  # swDimensionTextSuffix
+    D.ShowParenthesis = bool(args.get("parenthesis", False))
+
+    tol = T(dim.Tolerance, "IDimensionTolerance")
+    up, lo, fit = args.get("tol_upper"), args.get("tol_lower"), args.get("fit")
+    if fit:
+        f = str(fit).strip()
+        if "/" in f:
+            hole, shaft = f.split("/", 1)       # 'H7/g6'
+        elif f[:1].isupper():
+            hole, shaft = f, ""                 # 'H7' -- hole
+        else:
+            hole, shaft = "", f                 # 'h7' -- shaft
+        tol.Type = 8 if (up is not None or lo is not None) else 7  # swTolFITWITHTOL / swTolFIT
+        if not tol.SetFitValues(hole, shaft):
+            parts.append(f"⚠ SetFitValues({hole!r},{shaft!r}) failed")
+        else:
+            parts.append(f"fit {f}")
+    if up is not None or lo is not None:
+        u, l = float(up or 0.0), float(lo or 0.0)
+        if fit is None:
+            tol.Type = 4 if abs(u + l) < 1e-9 and u > 0 else 2  # swTolSYMMETRIC / swTolBILAT
+        if not tol.SetValues(l / 1000.0, u / 1000.0):
+            parts.append("⚠ IDimensionTolerance.SetValues failed")
+        else:
+            parts.append(f"tol {'+' if u >= 0 else ''}{fnum(u, 3)}/{fnum(l, 3)}")
+    md.GraphicsRedraw2()
+
+    val = dim.SystemValue * 1000.0
+    warn = " | ⚠ value is 0 -- edges probably coincide in this view" if abs(val) < 1e-6 else ""
+    ann = D.GetAnnotation()
+    return _ok(f"Added dimension {T(ann, 'IAnnotation').GetName()!r} = {fnum(val, 3)}mm "
+               f"({dim.FullName}) in '{view.GetName2()}' at {_ann_pos(ann)}"
+               + (f" | {prefix!r} prefix" if prefix else "")
+               + "".join(f" | {p}" for p in parts) + warn)
+
+
+# ISO geometric-tolerance symbols, names as in <SW data>/lang/english/gtol.sym
+# (#IGTOL section; #GGTOL is the GOST set with the same names plus AXIS/LONG).
+_GTOL_ALIASES = {
+    "runout": "SRUN", "circular_runout": "SRUN", "total_runout": "TRUN",
+    "cylindricity": "CYL", "parallelism": "PARA", "perpendicularity": "PERP",
+    "flatness": "FLAT", "position": "POSI", "concentricity": "CONC",
+    "coaxiality": "CONC", "circularity": "CIRC", "roundness": "CIRC",
+    "straightness": "STRAIGHT", "symmetry": "SYMMETRY", "angularity": "ANGULAR",
+    "profile_line": "LPROF", "profile_surface": "SPROF",
+}
+
+
+def _gtol_symbol(sym: str, library: str) -> str:
+    s = str(sym).strip()
+    if s.startswith("<"):
+        return s
+    s = _GTOL_ALIASES.get(s.lower(), s.upper())
+    return f"<{library.upper()}-{s}>"
+
+
+def _gtols(view) -> list:
+    out, g = [], view.GetFirstGTOL()
+    while g is not None:
+        gt = T(g, "IGtol")
+        out.append(gt)
+        g = gt.GetNextGTOL()
+    return out
+
+
+def t_add_gtol(app, args):
+    """Feature control frame, optionally leadered to a model edge.
+
+    Confirmed live 2026-09-22 (SW 2026):
+    - SetFrameSymbols2's GCS is a STRING (typelib VT_BSTR), the symbol's name
+      from gtol.sym ('<IGTOL-SRUN>'), not a swGcs* int: 25 renders literally.
+    - InsertGtol gives a legacy-format frame (GetFormat()==1 == GTOL_SW2021).
+      Set symbols and values on THAT, then ConvertFormat() -> GTOL_SW2022 with
+      everything kept. Converting FIRST is what breaks: the tolerance value is
+      lost (GetFrameValues -> None) or SetFrameValues2 throws 'server threw
+      an exception', because the handle is stale after conversion -- re-fetch
+      it (view.GetFirstGTOL chain, by annotation name) before touching it."""
+    drw = drawing(app)
+    md = model(app)
+    view, _ = _find_view(drw, md, str(args["view"]))
+    edge = args.get("edge")
+    if edge not in (None, ""):
+        _select_edges(md, view, [edge])
+    else:
+        md.ClearSelection2(True)
+    g = md.InsertGtol()
+    md.ClearSelection2(True)
+    if g is None:
+        raise ExtError("InsertGtol returned None")
+    G = T(g, "IGtol")
+    name = T(G.GetAnnotation(), "IAnnotation").GetName()
+
+    sym = _gtol_symbol(args["symbol"], str(args.get("library", "IGTOL")))
+    G.SetFrameSymbols2(1, sym, bool(args.get("diameter", False)), "", False, "", "", "", "")
+    tolv = str(args.get("tolerance", ""))
+    datums = parse_names(args.get("datum", ""))[:3]
+    datums += [""] * (3 - len(datums))
+    if not G.SetFrameValues2(1, tolv, "", *datums):
+        raise ExtError("SetFrameValues2 returned False")
+    if bool(args.get("convert", True)) and G.GetFormat() == 1:
+        G.ConvertFormat()
+        fresh = [x for x in _gtols(view) if T(x.GetAnnotation(), "IAnnotation").GetName() == name]
+        G = fresh[0] if fresh else G
+
+    _place(G.GetAnnotation(), args.get("x"), args.get("y"))
+    got_vals = G.GetFrameValues(1) or ()
+    got_sym = (G.GetFrameSymbols3(1) or ("",))[0]
+    warn = ""
+    if (got_vals[:1] or ("",))[0] != tolv or got_sym != sym:
+        warn = f" | ⚠ read back symbol={got_sym!r} values={got_vals!r}"
+    return _ok(f"Added gtol {name!r} {sym} {tolv} {' '.join(d for d in datums if d)} "
+               f"in '{view.GetName2()}' (format {G.GetFormat()}) at {_ann_pos(G.GetAnnotation())}"
+               + (f" on edge {edge}" if edge not in (None, "") else "") + warn)
+
+
+def t_add_datum(app, args):
+    """Datum feature symbol on a model edge. InsertDatumTag2 attaches to the
+    selection (IView.SelectEntity), SetLabel sets the letter."""
+    drw = drawing(app)
+    md = model(app)
+    view, _ = _find_view(drw, md, str(args["view"]))
+    _select_edges(md, view, [args["edge"]])
+    dt = md.InsertDatumTag2()
+    md.ClearSelection2(True)
+    if dt is None:
+        raise ExtError("InsertDatumTag2 returned None")
+    DT = T(dt, "IDatumTag")
+    label = str(args.get("label", "")).strip()
+    if label and not DT.SetLabel(label):
+        raise ExtError(f"SetLabel({label!r}) failed")
+    ann = DT.GetAnnotation()
+    _place(ann, args.get("x"), args.get("y"))
+    return _ok(f"Added datum {DT.GetLabel()!r} ({T(ann, 'IAnnotation').GetName()}) on edge "
+               f"{args['edge']} in '{view.GetName2()}' at {_ann_pos(ann)}")
+
+
+_SF_SYMBOLS = {"basic": 0, "machined": 1, "no_machining": 2}  # swSFBasic / swSFMachining_Req / swSFDont_Machine
+
+
+def t_add_surface_finish(app, args):
+    """Surface finish symbol, optionally leadered to a model edge.
+
+    Which ISFSymbol text slot is DRAWN depends on the document's surface
+    finish standard (swDetailingSFSymbolStandard, pref 629), not on the
+    drafting standard -- confirmed live 2026-09-22 on two GOST drawings:
+      0 ISO 1302:1992     -> slots 1-7 render; MaxRoughness lands in slot 5 -- OK
+      1 ISO 1302:2002     -> slots 1,2,8,9,10 render
+      2 ISO 21920-1       -> slots 2,8,9,10 render
+    so the roughness goes to slot 5 under 1992 and slot 8
+    (swSFSymbolRoughnessValue1) otherwise. Text in a non-rendering slot is
+    stored and read back fine -- only the picture tells.
+    InsertSurfaceFinishSymbol3's LocX/Y are ignored for a symbol with no
+    leader (it lands at 0,0), hence SetPosition2 afterwards."""
+    drw = drawing(app)
+    md = model(app)
+    ext_ = T(md.Extension, "IModelDocExtension")
+    view, _ = _find_view(drw, md, str(args["view"]))
+    edge = args.get("edge")
+    attached = edge not in (None, "")
+    if attached:
+        pts = _select_edges(md, view, [edge])
+    else:
+        md.ClearSelection2(True)
+    kind = str(args.get("symbol", "machined")).strip().lower()
+    if kind not in _SF_SYMBOLS:
+        raise ExtError(f"Unknown symbol '{kind}' (have: {sorted(_SF_SYMBOLS)})")
+    x, y = args.get("x"), args.get("y")
+    if (x is None or y is None) and attached:
+        x, y = _default_text_pos(view, pts, 5.0)
+    if x is None or y is None:
+        raise ExtError("x,y are required for a surface finish symbol without an edge")
+    sf = ext_.InsertSurfaceFinishSymbol3(_SF_SYMBOLS[kind], 1 if attached else 0,
+                                         float(x) / 1000.0, float(y) / 1000.0, 0.0,
+                                         0, 0, "", "", "", "", "", "", "")
+    md.ClearSelection2(True)
+    if sf is None:
+        raise ExtError("InsertSurfaceFinishSymbol3 returned None")
+    S = T(sf, "ISFSymbol")
+    std = ext_.GetUserPreferenceInteger(629, 0)  # swDetailingSFSymbolStandard
+    slot = 5 if std == 0 else 8
+    value = str(args.get("value", ""))
+    if value and not S.SetText(slot, value):
+        raise ExtError(f"ISFSymbol.SetText({slot}, {value!r}) failed")
+    _place(S.GetAnnotation(), x, y)
+    std_name = {0: "ISO 1302:1992", 1: "ISO 1302:2002", 2: "ISO 21920-1"}.get(std, f"#{std}")
+    return _ok(f"Added surface finish {T(S.GetAnnotation(), 'IAnnotation').GetName()!r} "
+               f"{value!r} (slot {slot}, SF standard {std_name}) in '{view.GetName2()}' "
+               f"at {_ann_pos(S.GetAnnotation())}" + (f" on edge {edge}" if attached else ""))
+
+
+_ANNOTATION_KINDS = {"dimension": "DIMENSION", "datum": "DATUMTAG", "gtol": "GTOL",
+                     "surface_finish": "SFSYMBOL", "note": "NOTE"}
+
+
+def t_delete_annotation(app, args):
+    """IAnnotation.Select3 returns False for dims/datum tags in a drawing view
+    (confirmed live 2026-09-22); SelectByID2('<name>@<view FEATURE name>',
+    TYPE) + DeleteSelection2 works. The view part must be the feature name
+    ('Drawing View3'), not a section view's display name -- resolved here."""
+    drw = drawing(app)
+    md = model(app)
+    ext_ = T(md.Extension, "IModelDocExtension")
+    view, fname = _find_view(drw, md, str(args["view"]))
+    kind = str(args.get("kind", "dimension")).strip().lower()
+    typ = _ANNOTATION_KINDS.get(kind)
+    if typ is None:
+        raise ExtError(f"Unknown kind '{kind}' (have: {sorted(_ANNOTATION_KINDS)})")
+    names = parse_names(args["names"])
+    done, missing = [], []
+    for nm in names:
+        md.ClearSelection2(True)
+        if ext_.SelectByID2(f"{nm}@{fname}", typ, 0, 0, 0, False, 0, None, 0) and ext_.DeleteSelection2(0):
+            done.append(nm)
+        else:
+            missing.append(nm)
+    md.ClearSelection2(True)
+    msg = f"Deleted {len(done)} {kind}(s) from '{view.GetName2()}': {', '.join(done) or '-'}"
+    if missing:
+        msg += f" | ⚠ not found as {typ} in {fname}: {', '.join(missing)}"
+    return _ok(msg)
+
+
 HANDLERS = {
     "inspect": t_inspect,
     "list_faces": t_list_faces,
@@ -1783,6 +2706,21 @@ HANDLERS = {
     "sketch_entities": t_sketch_entities,
     "add_sketch_relation": t_add_sketch_relation,
     "add_sketch_dimension": t_add_sketch_dimension,
+    "create_drawing": t_create_drawing,
+    "add_standard_views": t_add_standard_views,
+    "add_drawing_view": t_add_drawing_view,
+    "add_section_view": t_add_section_view,
+    "add_detail_view": t_add_detail_view,
+    "insert_model_dimensions": t_insert_model_dimensions,
+    "add_note": t_add_note,
+    "export_pdf": t_export_pdf,
+    "move_drawing_view": t_move_drawing_view,
+    "delete_drawing_view": t_delete_drawing_view,
+    "add_drawing_dimension": t_add_drawing_dimension,
+    "add_gtol": t_add_gtol,
+    "add_datum": t_add_datum,
+    "add_surface_finish": t_add_surface_finish,
+    "delete_annotation": t_delete_annotation,
 }
 
 
@@ -1835,6 +2773,9 @@ _XYZ_MATCH = {
     "tolerance": {"type": "number", "default": 0.1, "description": "mm"},
     "type": {"type": "string", "description": "Optional type filter (PLANE/CYL/CONE/TORUS... or LINE/CIRC...)"},
 }
+
+_EDGE_DESC = ("Edge of the part shown in the view: an index from list_edges on that part ('12'), "
+              "or a model point 'x,y,z' in part mm -- the nearest edge to it is used")
 
 TOOL_SCHEMAS = [
     ("inspect",
@@ -1992,4 +2933,153 @@ TOOL_SCHEMAS = [
      "Hot-reload the server's Python code (automation/*, ext.py) from disk after editing it. "
      "Keeps the SolidWorks connection. New/changed tool SCHEMAS still need an MCP restart.",
      _obj({})),
+    ("create_drawing",
+     "Create a new drawing document from SolidWorks' default drawing template (disk search, "
+     "then the running app's own configured default). Becomes the active document.",
+     _obj({})),
+    ("add_standard_views",
+     "Lay out the standard 3 views (+ isometric) of a saved part/assembly on the active drawing "
+     "sheet in one call, per first- or third-angle projection. model_path must be a real file on "
+     "disk (does not need to be open). Active document must be a drawing (create_drawing first).",
+     _obj({"model_path": {"type": "string", "description": "Full path to a saved .sldprt/.sldasm"},
+           "projection": {"type": "string", "enum": ["first", "third"], "default": "third",
+                           "description": "first = ISO/Europe, third = ANSI/US"}},
+          ["model_path"])),
+    ("add_drawing_view",
+     "Add a single named view of a saved part/assembly to the active drawing sheet. "
+     "view: Front/Back/Left/Right/Top/Bottom/Isometric/Dimetric/Trimetric/Current. "
+     "x,y = sheet position in mm from the sheet origin (bottom-left). Active document must be "
+     "a drawing (create_drawing first).",
+     _obj({"model_path": {"type": "string", "description": "Full path to a saved .sldprt/.sldasm"},
+           "view": {"type": "string", "default": "current"},
+           "x": {"type": "number", "default": 100, "description": "mm"},
+           "y": {"type": "number", "default": 100, "description": "mm"},
+           "scale": {"type": "number", "description": "e.g. 0.5 for 1:2; omit to keep sheet scale"}},
+          ["model_path"])),
+    ("add_section_view",
+     "Cut a section view through an existing drawing view along a straight line. source_view must "
+     "already be on the sheet (add_drawing_view/add_standard_views). x1,y1,x2,y2 = cutting line "
+     "endpoints, x,y = where the new section view lands -- both in sheet mm, same coordinate space "
+     "as add_drawing_view's x,y (NOT relative to source_view; the tool converts to the view's own "
+     "sketch space). Extend the line past the view outline. depth=0 cuts fully through. "
+     "Remove with delete_drawing_view (also clears the section line it leaves in the parent).",
+     _obj({"source_view": {"type": "string", "description": "e.g. 'Drawing View1'"},
+           "x1": {"type": "number", "description": "mm"}, "y1": {"type": "number", "description": "mm"},
+           "x2": {"type": "number", "description": "mm"}, "y2": {"type": "number", "description": "mm"},
+           "x": {"type": "number", "description": "mm, new view placement"},
+           "y": {"type": "number", "description": "mm, new view placement"},
+           "label": {"type": "string", "description": "e.g. 'A'; omit for auto next letter"},
+           "depth": {"type": "number", "default": 0, "description": "mm, 0 = full depth"},
+           "options": {"type": "string",
+                       "description": "Comma-separated: not_aligned, offset, change_direction, "
+                                      "scale_with_model, partial, display_surface_cut, "
+                                      "exclude_fasteners, cut_surface_bodies"}},
+          ["source_view", "x1", "y1", "x2", "y2", "x", "y"])),
+    ("add_detail_view",
+     "Magnify a circular area of an existing drawing view into its own detail view. source_view "
+     "must already be on the sheet. x,y,radius = the circle to magnify (sheet mm, on source_view); "
+     "place_x,place_y = where the new detail view lands. scale 2.0 = '2:1'.",
+     _obj({"source_view": {"type": "string", "description": "e.g. 'Drawing View1'"},
+           "x": {"type": "number", "description": "mm, circle centre"},
+           "y": {"type": "number", "description": "mm, circle centre"},
+           "radius": {"type": "number", "description": "mm"},
+           "place_x": {"type": "number", "description": "mm, new view placement"},
+           "place_y": {"type": "number", "description": "mm, new view placement"},
+           "scale": {"type": "number", "default": 2.0},
+           "label": {"type": "string", "description": "e.g. 'A'; omit for auto next letter"},
+           "style": {"type": "string", "enum": ["standard", "broken", "leader", "noleader", "connected"],
+                     "default": "standard"},
+           "full_outline": {"type": "boolean", "default": True},
+           "jagged_outline": {"type": "boolean", "default": False},
+           "no_outline": {"type": "boolean", "default": False},
+           "shape_intensity": {"type": "integer", "default": 1}},
+          ["source_view", "x", "y", "radius", "place_x", "place_y"])),
+    ("insert_model_dimensions",
+     "Pull driving dimensions from the model into the given drawing view(s). Only dimensions "
+     "native to geometry actually visible from a view land in it -- e.g. a hole's diameter only "
+     "appears in a view where its round profile is shown edge-on, not just a centre mark. "
+     "views omitted = every view on the active sheet.",
+     _obj({"views": {"type": "string", "description": "Comma-separated view names; omit for all"},
+           "option": {"type": "integer", "default": 0}})),
+    ("add_note",
+     "Add a text note to the active drawing sheet at a fixed position (not attached to any "
+     "geometry). x,y = sheet mm from the sheet origin; stay within the sheet's own paper size or "
+     "the note renders on screen but gets cropped out of a PDF export.",
+     _obj({"text": {"type": "string"},
+           "x": {"type": "number", "default": 100, "description": "mm"},
+           "y": {"type": "number", "default": 100, "description": "mm"},
+           "height": {"type": "number", "description": "mm text height; omit for the sheet default"}},
+          ["text"])),
+    ("move_drawing_view",
+     "Move a drawing view so its centre sits at x,y (sheet mm). Aligned (projected/section) views "
+     "can only slide along their alignment axis.",
+     _obj({"view": {"type": "string", "description": "Display name ('Section View A-A') or feature name"},
+           "x": {"type": "number", "description": "mm"}, "y": {"type": "number", "description": "mm"}},
+          ["view", "x", "y"])),
+    ("delete_drawing_view",
+     "Delete a drawing view. For a section view this also removes the section line it leaves "
+     "behind in the parent view and the cutting line that section line hands back to the parent's sketch.",
+     _obj({"view": {"type": "string", "description": "Display name or feature name"}}, ["view"])),
+    ("add_drawing_dimension",
+     "Driven dimension in a drawing view from model edges: one circular edge -> diameter, two edges -> "
+     "distance. x,y = text position in sheet mm (also decides horizontal/vertical/aligned; omit to put "
+     "it 10 mm above the edges). Optional prefix (e.g. '<MOD-DIAM>'), tol_upper/tol_lower in mm "
+     "(bilateral; +a/-a gives symmetric), fit ('H7', 'h7' or 'H7/g6'). Parentheses off unless parenthesis=true.",
+     _obj({"view": {"type": "string"},
+           "edge1": {"type": "string", "description": _EDGE_DESC},
+           "edge2": {"type": "string", "description": "Second edge, same format; omit for a diameter/radius"},
+           "x": {"type": "number", "description": "mm, text position"},
+           "y": {"type": "number", "description": "mm, text position"},
+           "prefix": {"type": "string"}, "suffix": {"type": "string"},
+           "tol_upper": {"type": "number", "description": "mm, e.g. 0.2"},
+           "tol_lower": {"type": "number", "description": "mm, e.g. -0.1"},
+           "fit": {"type": "string", "description": "'H7' (hole), 'h7' (shaft) or 'H7/g6'"},
+           "parenthesis": {"type": "boolean", "default": False}},
+          ["view", "edge1"])),
+    ("add_gtol",
+     "Geometric tolerance frame in a drawing view, leadered to a model edge (or free without edge). "
+     "symbol: runout, total_runout, cylindricity, parallelism, perpendicularity, flatness, position, "
+     "concentricity, circularity, straightness, symmetry, angularity, profile_line, profile_surface -- "
+     "or a gtol.sym name ('SRUN', '<IGTOL-SRUN>'). Decimal comma as the drawing expects ('0,04').",
+     _obj({"view": {"type": "string"},
+           "edge": {"type": "string", "description": _EDGE_DESC + "; omit for a free frame"},
+           "symbol": {"type": "string"},
+           "tolerance": {"type": "string", "description": "e.g. '0,04'"},
+           "datum": {"type": "string", "description": "Up to 3, comma-separated: 'A' or 'A,B'"},
+           "diameter": {"type": "boolean", "default": False, "description": "Ø before the tolerance"},
+           "x": {"type": "number", "description": "mm, frame position"},
+           "y": {"type": "number", "description": "mm, frame position"},
+           "library": {"type": "string", "default": "IGTOL", "description": "IGTOL (ISO) or GGTOL (GOST)"},
+           "convert": {"type": "boolean", "default": True,
+                       "description": "Upgrade to the SW2022 gtol format after filling it in"}},
+          ["view", "symbol", "tolerance"])),
+    ("add_datum",
+     "Datum feature symbol attached to a model edge in a drawing view.",
+     _obj({"view": {"type": "string"},
+           "edge": {"type": "string", "description": _EDGE_DESC},
+           "label": {"type": "string", "description": "e.g. 'A'; omit for the next free letter"},
+           "x": {"type": "number", "description": "mm, symbol position"},
+           "y": {"type": "number", "description": "mm, symbol position"}},
+          ["view", "edge"])),
+    ("add_surface_finish",
+     "Surface roughness symbol in a drawing view, leadered to a model edge or free (then x,y required). "
+     "value e.g. 'Ra 3,2'; the text slot that renders depends on the document's surface-finish "
+     "standard and is chosen automatically.",
+     _obj({"view": {"type": "string"},
+           "edge": {"type": "string", "description": _EDGE_DESC + "; omit for a free symbol"},
+           "value": {"type": "string", "description": "e.g. 'Ra 3,2'"},
+           "symbol": {"type": "string", "enum": ["machined", "basic", "no_machining"], "default": "machined"},
+           "x": {"type": "number", "description": "mm"}, "y": {"type": "number", "description": "mm"}},
+          ["view", "value"])),
+    ("delete_annotation",
+     "Delete annotations from a drawing view by name (as returned by the add_* tools: 'RD1', "
+     "'DetailItem12'). kind: dimension, datum, gtol, surface_finish, note.",
+     _obj({"view": {"type": "string"},
+           "names": {"type": "string", "description": "Comma-separated"},
+           "kind": {"type": "string", "enum": ["dimension", "datum", "gtol", "surface_finish", "note"],
+                    "default": "dimension"}},
+          ["view", "names"])),
+    ("export_pdf",
+     "Export the active drawing to PDF. path must end in .pdf and its directory must already exist.",
+     _obj({"path": {"type": "string"}}, ["path"])),
 ]
