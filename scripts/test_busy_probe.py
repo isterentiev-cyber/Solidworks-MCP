@@ -12,8 +12,9 @@ import time
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve()
-sys.path.insert(0, r"D:\Claude\tools\solidworks-mcp")
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 from solidworks_mcp import ext
 
 u32 = ctypes.WinDLL("user32", use_last_error=True)
