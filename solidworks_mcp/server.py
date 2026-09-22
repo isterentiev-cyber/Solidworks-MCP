@@ -17,6 +17,7 @@ Fixes v4.0.0:
 """
 
 import io
+import os
 import sys
 import json
 import importlib
@@ -460,12 +461,48 @@ def format_result(r: Dict) -> str:
 # Tool Handlers
 # ============================================================================
 
+# Tools that must answer even while SolidWorks is wedged: they either do not
+# touch the live document at all, or they are how you find out what is wrong.
+BUSY_EXEMPT = {
+    "connect_solidworks",
+    "get_solidworks_info",
+    "lookup_api_signature",
+    "lookup_api_constant",
+    "reload_api",
+    "set_units",
+}
+
+
+def _busy_timeout_ms() -> int:
+    """SW_MCP_BUSY_TIMEOUT_MS overrides the default; 0 disables the probe."""
+    raw = os.environ.get("SW_MCP_BUSY_TIMEOUT_MS", "").strip()
+    if not raw:
+        return ext.BUSY_TIMEOUT_MS
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"SW_MCP_BUSY_TIMEOUT_MS={raw!r} is not a number, using default")
+        return ext.BUSY_TIMEOUT_MS
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle MCP tool calls"""
     try:
         logger.info(f"Tool: {name}, Args: {arguments}")
         arguments = arguments or {}
+
+        # Refuse rather than block. Everything below marshals COM into
+        # SLDWORKS.exe synchronously on this thread, so a modal dialog or a
+        # long rebuild over there does not slow us down -- it freezes the
+        # whole server. One ~0.3 ms window ping turns that into an answer.
+        # Tools that do not touch the live document are exempt: they must
+        # keep working precisely when SolidWorks is stuck.
+        if name not in BUSY_EXEMPT and sw_automation.is_connected:
+            busy = ext.sw_busy(sw_automation.app, _busy_timeout_ms())
+            if busy:
+                logger.warning(f"{name} refused: {busy}")
+                return [TextContent(type="text", text=f"[ERROR] {busy}")]
 
         # Feature tools get a volume/topology delta appended (ext.delta),
         # so every step is self-verifying without extra inspect calls.

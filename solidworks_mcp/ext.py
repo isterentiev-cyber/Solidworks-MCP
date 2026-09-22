@@ -1306,6 +1306,111 @@ def t_transaction(app, args):
 
 
 # ============================================================================
+# Stage 2: busy probe -- refuse instead of hanging
+# ============================================================================
+#
+# The problem this solves: every COM call is marshalled into SLDWORKS.exe from
+# outside, synchronously, on the asyncio event-loop thread. If SolidWorks has a
+# modal dialog open or is grinding through a rebuild, the call does not fail --
+# it BLOCKS, and takes the whole MCP server with it: no other tool can run, no
+# cancel is processed, and the client eventually times out with nothing useful
+# to say. This is the single worst failure mode of an out-of-process server,
+# and the in-process add-in architecture (SW+) does not have it at all.
+#
+# The fix is the trick SW+ uses from inside, which works just as well from
+# outside because it needs only a window handle: ping the main window with
+# SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG). A responsive window answers in
+# well under a millisecond (measured: 0.3 ms). A window that is modal or busy
+# does not answer, and the API returns ERROR_TIMEOUT instead of blocking.
+
+import ctypes
+import ctypes.wintypes as _w
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_SendMessageTimeoutW = _user32.SendMessageTimeoutW
+_SendMessageTimeoutW.argtypes = [_w.HWND, _w.UINT, _w.WPARAM, _w.LPARAM,
+                                 _w.UINT, _w.UINT, ctypes.POINTER(ctypes.c_size_t)]
+_SendMessageTimeoutW.restype = _w.LPARAM
+_IsWindow = _user32.IsWindow
+_IsWindow.argtypes = [_w.HWND]
+_IsWindow.restype = _w.BOOL
+
+_WM_NULL = 0x0000
+_SMTO_BLOCK = 0x0001
+_SMTO_ABORTIFHUNG = 0x0002
+_ERROR_TIMEOUT = 1460
+
+# Default ping budget. Generous next to the 0.3 ms an idle window takes, and
+# still 400x cheaper than waiting out a client-side timeout on a hung call.
+BUSY_TIMEOUT_MS = 1200
+
+_HWND_CACHE: Dict[int, int] = {}
+
+
+def sw_hwnd(app) -> Optional[int]:
+    """Handle of the SolidWorks main window, cached.
+
+    Cached deliberately: fetching it goes through Frame(), which is itself a
+    COM call and would hang for exactly the reason we are trying to detect.
+    The cache is validated with IsWindow, so a restarted SolidWorks is picked
+    up on the next call rather than probing a dead handle forever.
+    """
+    key = id(app)
+    hwnd = _HWND_CACHE.get(key)
+    if hwnd and _IsWindow(_w.HWND(hwnd)):
+        return hwnd
+    try:
+        hwnd = int(T(app.Frame(), "IFrame").GetHWndx64())
+    except Exception:
+        try:
+            hwnd = int(T(app.Frame(), "IFrame").GetHWnd())
+        except Exception:
+            return None
+    if not hwnd or not _IsWindow(_w.HWND(hwnd)):
+        return None
+    _HWND_CACHE[key] = hwnd
+    return hwnd
+
+
+def sw_busy(app, timeout_ms: Optional[int] = None) -> Optional[str]:
+    """None if SolidWorks is ready to take a call, else why it is not.
+
+    Never raises and never blocks longer than timeout_ms: if this function
+    cannot decide, it returns None (assume ready) rather than blocking work on
+    its own uncertainty. A probe that itself becomes a failure mode would be
+    worse than no probe.
+    """
+    if timeout_ms is None:
+        timeout_ms = BUSY_TIMEOUT_MS
+    if timeout_ms <= 0:
+        return None
+
+    hwnd = sw_hwnd(app)
+    if hwnd is None:
+        # No window to ping: SolidWorks may be starting or headless. Not our
+        # call to make -- let the real COM call produce the real error.
+        return None
+
+    out = ctypes.c_size_t(0)
+    ctypes.set_last_error(0)
+    rc = _SendMessageTimeoutW(_w.HWND(hwnd), _WM_NULL, 0, 0,
+                              _SMTO_BLOCK | _SMTO_ABORTIFHUNG,
+                              int(timeout_ms), ctypes.byref(out))
+    if rc:
+        return None
+    err = ctypes.get_last_error()
+    if err == _ERROR_TIMEOUT:
+        return (f"SolidWorks is not responding ({timeout_ms} ms): a modal "
+                f"dialog is open, or a long rebuild/macro is running. Close "
+                f"the dialog or wait for it to finish, then retry. "
+                f"(Refused instead of blocking the whole server.)")
+    # Window vanished between IsWindow and the ping, or some other Win32
+    # problem: say what happened, but do not pretend to know it is busy.
+    _HWND_CACHE.pop(id(app), None)
+    return None
+
+
+# ============================================================================
 # Stage 1: reference geometry, mass, rebuild errors, feature editing
 # ============================================================================
 
