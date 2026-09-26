@@ -6,81 +6,74 @@ Everything added on top of the upstream server lives here so that
 (tool *schemas* still need a client restart; handler code does not).
 
 Design rules (see CLAUDE.md / NOTES.md):
-- All COM objects go through `T(obj, "IInterface")` -- the makepy-typed
-  wrapper from utils/typelib.py. With typed wrappers every member is
-  deterministically a method or a property (per the typelib), which
-  removes the property-vs-method guessing that broke dynamic dispatch.
+- Late binding only. Every COM object is a `win32com.client.dynamic` wrapper;
+  `T(obj, "IInterface")` = QueryInterface to that interface + dynamic wrap.
+  No makepy / gencache / EnsureDispatch anywhere (see utils/com_helpers.py
+  for why and for the calling rules).
+- Zero-arg members (property or method): `v(obj, "Name")`. Out-params:
+  `com.out_int()` & co, or `com.call_out(obj, "M", ..., OUT)`. Null object
+  arguments: `com.nothing()`, never a bare None.
 - All user-facing numbers are millimetres / degrees. SW internals are
   metres / radians.
 - Results are compact single-line text: this output is read by a model,
   every token counts.
 """
 
+import hashlib
 import json
 import math
 import os
 import tempfile
 import time
-import types
 import logging
 import traceback
 from typing import Dict, List, Optional
 
 import pythoncom
 import win32com.client
+from win32com.client import dynamic
 
-from .utils.typelib import get_sw_module, get_constant, get_const_module
+from .utils import com_helpers as com
+from .utils.com_helpers import v, nothing, OUT, call_out
+from .utils.typelib import get_iid, get_constant, constants as typelib_constants
 from .utils.sw_finder import find_template
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Typed COM access
+# Late-bound COM access
 # ============================================================================
 
 def T(obj, iface: str):
-    """Wrap a COM object into its makepy-typed interface class.
+    """Late-bound view of a COM object through one of its interfaces.
 
     QueryInterface first: SW objects implement several interfaces (a sketch
-    object is also its IFeature), and invoking one interface's dispids on
-    another interface's IDispatch returns garbage (an int where a dispatch
-    was expected). Falls back to a plain wrap if the object refuses the QI."""
+    object is also its IFeature), and names resolved on one interface's
+    IDispatch can hit another interface's dispids. The IID comes from the
+    registered typelib (utils/typelib.py, no codegen). Falls back to the
+    object's own IDispatch if it refuses the QI."""
     if obj is None:
         return None
-    cls = getattr(get_sw_module(), iface)
     ole = getattr(obj, "_oleobj_", obj)
     try:
-        ole = ole.QueryInterface(cls.CLSID, pythoncom.IID_IDispatch)
+        ole = ole.QueryInterface(get_iid(iface), pythoncom.IID_IDispatch)
     except pythoncom.com_error:
         pass
-    return cls(ole)
-
-
-def v(obj, name: str, *args):
-    """Read a member of a *typed* wrapper: call it if the typelib says it is
-    a method, return it as-is if it is a property."""
-    val = getattr(obj, name)
-    return val(*args) if isinstance(val, types.MethodType) else val
+    return dynamic.Dispatch(ole, iface)
 
 
 def empty_dispatch():
-    return win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+    return nothing()
 
 
 def select_by_id(ext_obj, name, typ, x=0.0, y=0.0, z=0.0, append=False, mark=0) -> bool:
-    """IModelDocExtension.SelectByID2 that works on both wrapper kinds: the
-    typed one wants Callout=None, the dynamic one a VT_DISPATCH VARIANT
-    (each rejects the other's form)."""
-    last = None
-    for callout in (None, empty_dispatch()):
-        try:
-            return bool(ext_obj.SelectByID2(name, typ, float(x), float(y), float(z),
-                                            append, mark, callout, 0))
-        except (TypeError, pythoncom.com_error) as e:
-            # typed: TypeError on the VARIANT; dynamic: DISP_E_TYPEMISMATCH on None
-            last = e
-    raise ExtError(f"SelectByID2({name!r}, {typ}) failed for both callout forms: {last}")
+    """IModelDocExtension.SelectByID2 with an empty Callout (VT_DISPATCH NULL)."""
+    try:
+        return bool(ext_obj.SelectByID2(name, typ, float(x), float(y), float(z),
+                                        append, mark, nothing(), 0))
+    except pythoncom.com_error as e:
+        raise ExtError(f"SelectByID2({name!r}, {typ}) failed: {e}")
 
 
 class ExtError(Exception):
@@ -99,7 +92,7 @@ def _err(message: str, code: int = 999, name: str = "swUnknownError") -> Dict:
 
 
 def model(app):
-    """Active document as typed IModelDoc2 (raises ExtError if none)."""
+    """Active document as IModelDoc2 (raises ExtError if none)."""
     if app is None:
         raise ExtError("Not connected to SolidWorks")
     doc = app.ActiveDoc
@@ -109,17 +102,14 @@ def model(app):
 
 
 def save_in_place(md):
-    """IModelDoc2.Save3 -> (ok, errors, warnings). Errors/Warnings are
-    by-ref out params: the typed wrapper returns them in a tuple; the
-    upstream dynamic call passed plain ints -> 'Type mismatch' (arg 2)."""
-    r = md.Save3(1, 0, 0)  # swSaveAsOptions_Silent
-    if isinstance(r, tuple):
-        return bool(r[0]), int(r[1]), int(r[2])
-    return bool(r), 0, 0
+    """IModelDoc2.Save3 -> (ok, errors, warnings); Errors/Warnings are
+    by-ref out params."""
+    ok, err, warn = call_out(md, "Save3", 1, OUT, OUT)  # swSaveAsOptions_Silent
+    return bool(ok), int(err or 0), int(warn or 0)
 
 
 def is_part(md) -> bool:
-    return md.GetType() == 1
+    return v(md, "GetType") == 1
 
 
 # ============================================================================
@@ -156,11 +146,11 @@ def parse_names(s) -> List[str]:
 # ============================================================================
 
 def iter_features(md):
-    f = md.FirstFeature()
+    f = v(md, "FirstFeature")
     while f is not None:
         f = T(f, "IFeature")
         yield f
-        f = f.GetNextFeature()
+        f = v(f, "GetNextFeature")
 
 
 def user_features(md):
@@ -228,8 +218,8 @@ def snapshot(app) -> Optional[Dict]:
         return {
             "V": volume_mm3(md),
             "B": len(bs),
-            "F": sum(b.GetFaceCount() for b in bs),
-            "E": sum(b.GetEdgeCount() for b in bs),
+            "F": sum(v(b, "GetFaceCount") for b in bs),
+            "E": sum(v(b, "GetEdgeCount") for b in bs),
             "feats": [f.Name for f in user_features(md)],
         }
     except Exception as e:
@@ -249,13 +239,9 @@ def feature_error_name(code) -> str:
     if _FEATURE_ERROR_NAMES is None:
         table: Dict[int, str] = {}
         try:
-            consts = get_const_module().constants
             prefix = "swFeatureError"
-            for n in dir(consts):
-                if not n.startswith(prefix):
-                    continue
-                val = getattr(consts, n)
-                if isinstance(val, int):
+            for n, val in typelib_constants().items():
+                if n.startswith(prefix) and isinstance(val, int):
                     table.setdefault(val, n[len(prefix):])
         except Exception:
             pass
@@ -264,12 +250,17 @@ def feature_error_name(code) -> str:
     return f"{name} ({code})" if name else f"code {code}"
 
 
+def error_code(feat):
+    """IFeature.GetErrorCode2 -> (code, is_warning); IsWarning is a by-ref out."""
+    code, warn = call_out(feat, "GetErrorCode2", com.Out(pythoncom.VT_BOOL))
+    return int(code or 0), bool(warn)
+
+
 def feature_errors(md, names: List[str]) -> List[str]:
     out = []
     for n in names:
         try:
-            r = find_feature(md, n).GetErrorCode2()
-            code, warn = (r if isinstance(r, tuple) else (r, False))
+            code, warn = error_code(find_feature(md, n))
             if code:
                 out.append(f"{'warning' if warn else 'ERROR'} in {n}: "
                            f"{feature_error_name(code)}")
@@ -283,7 +274,7 @@ _STATUS = {1: "unknown", 2: "UNDER-defined", 3: "fully defined", 4: "OVER-define
 
 
 def sketch_status(sk) -> int:
-    return T(sk, "ISketch").GetConstrainedStatus()
+    return v(T(sk, "ISketch"), "GetConstrainedStatus")
 
 
 def underdefined_parents(md, names: List[str]) -> List[str]:
@@ -297,15 +288,15 @@ def underdefined_parents(md, names: List[str]) -> List[str]:
         except ExtError:
             continue
         subs = []
-        sub = f.GetFirstSubFeature()
+        sub = v(f, "GetFirstSubFeature")
         while sub is not None:
             subs.append(T(sub, "IFeature"))
-            sub = T(sub, "IFeature").GetNextSubFeature()
-        for sf in subs + [T(x, "IFeature") for x in (f.GetParents() or ())]:
+            sub = v(T(sub, "IFeature"), "GetNextSubFeature")
+        for sf in subs + [T(x, "IFeature") for x in (v(f, "GetParents") or ())]:
             if v(sf, "GetTypeName2") != "ProfileFeature" or sf.Name in seen:
                 continue
             seen.add(sf.Name)
-            st = sketch_status(sf.GetSpecificFeature2())
+            st = sketch_status(v(sf, "GetSpecificFeature2"))
             if st != 3:
                 out.append(f"{sf.Name} is {_STATUS.get(st, st)} (sketch_entities / add_sketch_dimension / add_sketch_relation)")
     return out
@@ -357,11 +348,11 @@ _CURVE = {3001: "LINE", 3002: "CIRC", 3003: "ELLIPSE", 3004: "INTERSECT", 3005: 
 def face_rows(md) -> List[Dict]:
     rows, i = [], 0
     for bi, b in enumerate(bodies(md)):
-        for fo in b.GetFaces() or ():
+        for fo in v(b, "GetFaces") or ():
             i += 1
             f = T(fo, "IFace2")
-            s = T(f.GetSurface(), "ISurface")
-            st = s.Identity()
+            s = T(v(f, "GetSurface"), "ISurface")
+            st = v(s, "Identity")
             box = v(f, "GetBox")
             c = [(box[k] + box[k + 3]) / 2 for k in range(3)]
             p = list(f.GetClosestPointOn(*c)[:3])
@@ -381,21 +372,21 @@ def face_rows(md) -> List[Dict]:
                 tp = s.TorusParams
                 extra = f"R={fnum(tp[6] * 1000)} r={fnum(tp[7] * 1000)} c={fpt(tp[0:3])} axis={fdir(tp[3:6])}"
             rows.append({"i": i, "body": bi + 1, "type": _SURF.get(st, str(st)),
-                         "area": f.GetArea() * 1e6, "p": p, "extra": extra, "obj": f})
+                         "area": v(f, "GetArea") * 1e6, "p": p, "extra": extra, "obj": f})
     return rows
 
 
 def edge_rows(md) -> List[Dict]:
     rows, i = [], 0
     for bi, b in enumerate(bodies(md)):
-        for eo in b.GetEdges() or ():
+        for eo in v(b, "GetEdges") or ():
             i += 1
             e = T(eo, "IEdge")
-            c = T(e.GetCurve(), "ICurve")
-            cp = T(e.GetCurveParams3(), "ICurveParamData")
+            c = T(v(e, "GetCurve"), "ICurve")
+            cp = T(v(e, "GetCurveParams3"), "ICurveParamData")
             u0, u1 = cp.UMinValue, cp.UMaxValue
             length = c.GetLength3(u0, u1) * 1000
-            ct = c.Identity()
+            ct = v(c, "Identity")
             a, bpt = cp.StartPoint, cp.EndPoint
             if ct == 3001:
                 mid = [(a[k] + bpt[k]) / 2 for k in range(3)]
@@ -451,7 +442,7 @@ def select_face_at(md, p_mm, append: bool = False, mark: int = 0) -> Dict:
     if best["type"] == "PLANE":
         n = list(v(best["obj"], "Normal"))
     else:
-        ev = T(best["obj"].GetSurface(), "ISurface").EvaluateAtPoint(*p)
+        ev = T(v(best["obj"], "GetSurface"), "ISurface").EvaluateAtPoint(*p)
         n = list(ev[3:6]) if ev else [0.0, 0.0, 1.0]
     o = [p[k] + n[k] * 0.001 for k in range(3)]
     if not append:
@@ -473,7 +464,7 @@ def select_entities(md, kind: str, indices, append: bool = False, mark: int = 0)
     if not append:
         md.ClearSelection2(True)
     for n, i in enumerate(idx):
-        data = T(sm.CreateSelectData(), "ISelectData")
+        data = T(v(sm, "CreateSelectData"), "ISelectData")
         data.Mark = mark
         ok = T(by_i[i]["obj"], "IEntity").Select4(True if (append or n > 0) else False, data)
         if not ok:
@@ -488,15 +479,15 @@ def select_entities(md, kind: str, indices, append: bool = False, mark: int = 0)
 def xform(a, p) -> List[float]:
     """Apply an IMathTransform.ArrayData to a point. SW convention is a row
     vector: p' = (p · R) * scale + t, R = a[0:9] row-major, t = a[9:12].
-    (IMathUtility.CreatePoint with a Python list gets garbage through the
-    typed wrapper -- 1e-311 values -- so the math is done here.)"""
+    (IMathUtility.CreatePoint with a Python list gave garbage -- 1e-311
+    values -- so the math is done here.)"""
     s = a[12] if len(a) > 12 and a[12] else 1.0
     return [sum(p[i] * a[3 * i + j] for i in range(3)) * s + a[9 + j] for j in range(3)]
 
 
 def sketch_to_model(sk) -> List[float]:
     """ArrayData of the active sketch's sketch->model transform."""
-    return list(T(T(sk.ModelToSketchTransform, "IMathTransform").Inverse(), "IMathTransform").ArrayData)
+    return list(T(v(T(sk.ModelToSketchTransform, "IMathTransform"), "Inverse"), "IMathTransform").ArrayData)
 
 
 def sketch_frame(app) -> str:
@@ -570,7 +561,7 @@ def draw_profile(md, points, closed: bool = True, construction: bool = False) ->
 # ============================================================================
 
 def _plane_normal(md, plane_feat) -> List[float]:
-    rp = T(plane_feat.GetSpecificFeature2(), "IRefPlane")
+    rp = T(v(plane_feat, "GetSpecificFeature2"), "IRefPlane")
     a = T(rp.Transform, "IMathTransform").ArrayData
     return [a[6], a[7], a[8]]
 
@@ -598,7 +589,7 @@ def world_axis(md, axis: str) -> str:
     last.Name = name
     md.ClearSelection2(True)
     last.Select2(False, 0)
-    md.BlankRefGeom()
+    v(md, "BlankRefGeom")
     md.ClearSelection2(True)
     return name
 
@@ -629,8 +620,8 @@ def select_features(md, names, mark: int, append: bool = True):
 
 def t_inspect(app, args):
     md = model(app)
-    title = md.GetTitle()
-    lines = [f"{title} | {md.GetPathName() or '<unsaved>'}"]
+    title = v(md, "GetTitle")
+    lines = [f"{title} | {v(md, "GetPathName") or '<unsaved>'}"]
     if is_part(md):
         bs = bodies(md)
         vol = volume_mm3(md)
@@ -639,23 +630,23 @@ def t_inspect(app, args):
             area = T(v(md.Extension, "CreateMassProperty"), "IMassProperty").SurfaceArea * 1e6
         lines.append(f"bodies {len(bs)} | V {fnum(vol, 1)} mm³ | A {fnum(area, 1)} mm²")
         for bi, b in enumerate(bs):
-            bx = b.GetBodyBox()
+            bx = v(b, "GetBodyBox")
             size = [bx[k + 3] - bx[k] for k in range(3)]
-            fr = [T(f, "IFace2") for f in b.GetFaces() or ()]
+            fr = [T(f, "IFace2") for f in v(b, "GetFaces") or ()]
             kinds = {}
             for f in fr:
-                t = _SURF.get(T(f.GetSurface(), "ISurface").Identity(), "?")
+                t = _SURF.get(v(T(v(f, "GetSurface"), "ISurface"), "Identity"), "?")
                 kinds[t] = kinds.get(t, 0) + 1
             lines.append(
                 f"body{bi + 1}: bbox X[{fnum(bx[0]*1000)}..{fnum(bx[3]*1000)}] "
                 f"Y[{fnum(bx[1]*1000)}..{fnum(bx[4]*1000)}] Z[{fnum(bx[2]*1000)}..{fnum(bx[5]*1000)}] "
-                f"size {'×'.join(fnum(s*1000) for s in size)} | faces {b.GetFaceCount()} "
-                f"({', '.join(f'{k}×{n}' for k, n in sorted(kinds.items()))}) | edges {b.GetEdgeCount()}")
+                f"size {'×'.join(fnum(s*1000) for s in size)} | faces {v(b, "GetFaceCount")} "
+                f"({', '.join(f'{k}×{n}' for k, n in sorted(kinds.items()))}) | edges {v(b, "GetEdgeCount")}")
         try:
-            mat = T(md, "IPartDoc").GetMaterialPropertyName2("", "")
-            mat = mat[1] if isinstance(mat, tuple) else mat
+            mat, db = call_out(T(md, "IPartDoc"), "GetMaterialPropertyName2", "",
+                               com.Out(pythoncom.VT_BSTR))
             if mat:
-                lines.append(f"material: {mat}")
+                lines.append(f"material: {mat}" + (f" ({db})" if db else ""))
         except Exception:
             pass
     feats = []
@@ -672,9 +663,9 @@ def t_inspect(app, args):
     if sk is not None:
         lines.append("ACTIVE SKETCH open; " + sketch_frame(app))
     try:
-        em = T(md.GetEquationMgr(), "IEquationMgr")
-        if em.GetCount():
-            lines.append(f"equations: {em.GetCount()} (get_parameters for details)")
+        em = T(v(md, "GetEquationMgr"), "IEquationMgr")
+        if v(em, "GetCount"):
+            lines.append(f"equations: {v(em, "GetCount")} (get_parameters for details)")
     except Exception:
         pass
     return _ok("\n".join(lines))
@@ -838,12 +829,12 @@ def t_hole(app, args):
                           "CosmeticThreadType": get_constant("swCosmeticThreadWithCallout")})
         edits.append({"DrillAngle": math.radians(118)})
         for ed in edits:
-            data = T(feat.GetDefinition(), "IWizardHoleFeatureData2")
-            data.AccessSelections(md, None)
+            data = T(v(feat, "GetDefinition"), "IWizardHoleFeatureData2")
+            data.AccessSelections(md, nothing())
             for k, val in ed.items():
                 setattr(data, k, val)
-            if not feat.ModifyDefinition(data, md, None):
-                data.ReleaseSelectionAccess()
+            if not feat.ModifyDefinition(data, md, nothing()):
+                v(data, "ReleaseSelectionAccess")
                 logger.warning(f"could not update tapped hole definition {list(ed)}")
     msg = [f"{kind} {ssize}" + (" through all" if through else f" depth {fnum(depth)}")]
     if len(pts) > 1:
@@ -856,19 +847,19 @@ def t_hole(app, args):
 def _add_hole_points(md, feat, pts_mm) -> int:
     """Add placement points to a Hole Wizard feature. Its FIRST sub-sketch
     holds the positions; the second one is the hole's revolve profile."""
-    sub = feat.GetFirstSubFeature()
+    sub = v(feat, "GetFirstSubFeature")
     sketch_feat = None
     while sub is not None:
         sub = T(sub, "IFeature")
         if "Profile" in v(sub, "GetTypeName2"):
             sketch_feat = sub
             break
-        sub = sub.GetNextSubFeature()
+        sub = v(sub, "GetNextSubFeature")
     if sketch_feat is None:
         raise ExtError("Hole position sketch not found")
     md.ClearSelection2(True)
     sketch_feat.Select2(False, 0)
-    md.EditSketch()
+    v(md, "EditSketch")
     sm = T(md.SketchManager, "ISketchManager")
     sk = T(sm.ActiveSketch, "ISketch")
     m2s = list(T(sk.ModelToSketchTransform, "IMathTransform").ArrayData)
@@ -881,7 +872,7 @@ def _add_hole_points(md, feat, pts_mm) -> int:
             if sm.CreatePoint(q[0], q[1], 0) is not None:
                 added += 1
     sm.InsertSketch(True)
-    md.EditRebuild3()
+    v(md, "EditRebuild3")
     return added
 
 
@@ -947,8 +938,8 @@ def t_mirror(app, args):
 def t_get_parameters(app, args):
     md = model(app)
     lines = []
-    em = T(md.GetEquationMgr(), "IEquationMgr")
-    for i in range(em.GetCount()):
+    em = T(v(md, "GetEquationMgr"), "IEquationMgr")
+    for i in range(v(em, "GetCount")):
         eq = v(em, "Equation", i)
         val = v(em, "Value", i)
         gv = v(em, "GlobalVariable", i)
@@ -961,7 +952,7 @@ def t_get_parameters(app, args):
         for dd in display_dims(f):
             dim = T(dd.GetDimension2(0), "IDimension")
             val = dim.SystemValue
-            if dim.GetType() == 1:
+            if v(dim, "GetType") == 1:
                 s = f"{fnum(math.degrees(val), 3)}°"
             else:
                 s = fnum(val * 1000, 4)
@@ -990,7 +981,7 @@ def _eq_set(em, i: int, eq: str):
 
 def _eq_index(em, name: str) -> int:
     key = f'"{name}"'
-    for i in range(em.GetCount()):
+    for i in range(v(em, "GetCount")):
         if v(em, "Equation", i).strip().startswith(key):
             return i
     return -1
@@ -999,7 +990,7 @@ def _eq_index(em, name: str) -> int:
 def t_set_parameter(app, args):
     md = model(app)
     name, expr = args["name"], str(args["expression"]).strip()
-    em = T(md.GetEquationMgr(), "IEquationMgr")
+    em = T(v(md, "GetEquationMgr"), "IEquationMgr")
     all_cfg = get_constant("swAllConfiguration")
     before = snapshot(app)
     if "@" in name:
@@ -1012,7 +1003,7 @@ def t_set_parameter(app, args):
             if dim is None:
                 raise ExtError(f"Dimension '{name}' not found (get_parameters shows names)")
             dim = T(dim, "IDimension")
-            val = math.radians(num) if dim.GetType() == 1 else num / 1000
+            val = math.radians(num) if v(dim, "GetType") == 1 else num / 1000
             dim.SetSystemValue3(val, all_cfg, None)
         else:
             i = _eq_index(em, name)
@@ -1026,21 +1017,21 @@ def t_set_parameter(app, args):
         if i < 0:
             raise ExtError(f"Global variable '{name}' not found -- use add_parameter")
         _eq_set(em, i, f'"{name}" = {expr}')
-    em.EvaluateAll()
-    md.EditRebuild3()
+    v(em, "EvaluateAll")
+    v(md, "EditRebuild3")
     return _ok(f"{name} = {expr} | " + delta(app, before, snapshot(app)))
 
 
 def t_add_parameter(app, args):
     md = model(app)
     name, expr = args["name"], str(args["expression"]).strip()
-    em = T(md.GetEquationMgr(), "IEquationMgr")
+    em = T(v(md, "GetEquationMgr"), "IEquationMgr")
     if _eq_index(em, name) >= 0:
         raise ExtError(f"'{name}' already exists -- use set_parameter")
     eq = f'"{name}" = {expr}'
     if _eq_add(em, eq) < 0:
         raise ExtError(f"Equation rejected: {eq}")
-    em.EvaluateAll()
+    v(em, "EvaluateAll")
     i = _eq_index(em, name)
     return _ok(f"{eq} -> {fnum(v(em, 'Value', i), 4)}")
 
@@ -1065,7 +1056,7 @@ def t_suppress_feature(app, args):
     for n in parse_names(args["names"]):
         if not find_feature(md, n).SetSuppression2(state, get_constant("swThisConfiguration"), None):
             raise ExtError(f"SetSuppression2 failed on '{n}'")
-    md.EditRebuild3()
+    v(md, "EditRebuild3")
     return _ok(delta(app, before, snapshot(app)))
 
 
@@ -1082,7 +1073,7 @@ def sketch_feature(md, sk):
     u = sk._oleobj_.QueryInterface(pythoncom.IID_IUnknown)
     for f in user_features(md):
         if v(f, "GetTypeName2") in ("ProfileFeature", "3DProfileFeature"):
-            s2 = T(f.GetSpecificFeature2(), "ISketch")
+            s2 = T(v(f, "GetSpecificFeature2"), "ISketch")
             if s2._oleobj_.QueryInterface(pythoncom.IID_IUnknown) == u:
                 return f
     raise ExtError("Sketch feature not found in tree")
@@ -1102,8 +1093,8 @@ def sketch_items(md):
     """Addressable entities of the active sketch: S1.. segments, P1.. points,
     plus 'O' = the part origin. Coordinates are sketch 2D, mm."""
     sk = _active_sketch(md)
-    segs = [T(x, "ISketchSegment") for x in (sk.GetSketchSegments() or ())]
-    pts = [T(x, "ISketchPoint") for x in (sk.GetSketchPoints2() or ())]
+    segs = [T(x, "ISketchSegment") for x in (v(sk, "GetSketchSegments") or ())]
+    pts = [T(x, "ISketchPoint") for x in (v(sk, "GetSketchPoints2") or ())]
     return sk, segs, pts
 
 
@@ -1113,32 +1104,26 @@ def _pt(q) -> str:
 
 def display_dims(f):
     """Iterate IFeature display dimensions. With no dimensions SW returns an
-    int 0 instead of Nothing and the makepy wrapper crashes on it."""
-    try:
-        dd = f.GetFirstDisplayDimension()
-    except AttributeError:
-        return
-    while dd is not None:
+    int 0 instead of Nothing -- anything that is not a COM object ends the walk."""
+    dd = v(f, "GetFirstDisplayDimension")
+    while hasattr(dd, "_oleobj_"):
         dd = T(dd, "IDisplayDimension")
         yield dd
-        try:
-            dd = f.GetNextDisplayDimension(dd)
-        except AttributeError:
-            return
+        dd = f.GetNextDisplayDimension(dd)
 
 
 def _describe_seg(sg) -> str:
-    t = sg.GetType()
+    t = v(sg, "GetType")
     kind = _SEG_TYPES.get(t, str(t))
     c = " construction" if sg.ConstructionGeometry else ""
     if t == 0:
         ln = T(sg, "ISketchLine")
-        return f"LINE {_pt(T(ln.GetStartPoint2(), 'ISketchPoint'))}->{_pt(T(ln.GetEndPoint2(), 'ISketchPoint'))}{c}"
+        return f"LINE {_pt(T(v(ln, "GetStartPoint2"), 'ISketchPoint'))}->{_pt(T(v(ln, "GetEndPoint2"), 'ISketchPoint'))}{c}"
     if t == 1:
         arc = T(sg, "ISketchArc")
-        cen = T(arc.GetCenterPoint2(), "ISketchPoint")
-        full = arc.IsCircle()
-        return f"{'CIRCLE' if full else 'ARC'} c={_pt(cen)} r={fnum(arc.GetRadius() * 1000, 4)}{c}"
+        cen = T(v(arc, "GetCenterPoint2"), "ISketchPoint")
+        full = v(arc, "IsCircle")
+        return f"{'CIRCLE' if full else 'ARC'} c={_pt(cen)} r={fnum(v(arc, "GetRadius") * 1000, 4)}{c}"
     return kind + c
 
 
@@ -1147,7 +1132,7 @@ def _sketch_dims(md, sk) -> List[str]:
     for dd in display_dims(sketch_feature(md, sk)):
         dim = T(dd.GetDimension2(0), "IDimension")
         val = dim.SystemValue
-        val_s = f"{fnum(math.degrees(val), 3)}°" if dim.GetType() == 1 else fnum(val * 1000, 4)
+        val_s = f"{fnum(math.degrees(val), 3)}°" if v(dim, "GetType") == 1 else fnum(val * 1000, 4)
         out.append(f"{dim.Name}={val_s}")
     return out
 
@@ -1184,11 +1169,11 @@ def _select_sketch_items(md, tokens, mark: int = 0):
         i = int(t[1:]) - 1
         if not 0 <= i < len(pool):
             raise ExtError(f"No {tok} (have S1..S{len(segs)}, P1..P{len(pts)})")
-        data = T(sm.CreateSelectData(), "ISelectData")
+        data = T(v(sm, "CreateSelectData"), "ISelectData")
         data.Mark = mark
         if not pool[i].Select4(append, data):
             raise ExtError(f"Could not select {tok}")
-        kinds.append(t[0] if t[0] == "P" else ("L" if pool[i].GetType() == 0 else "A"))
+        kinds.append(t[0] if t[0] == "P" else ("L" if v(pool[i], "GetType") == 0 else "A"))
     return sk, kinds
 
 
@@ -1251,26 +1236,26 @@ def t_add_sketch_dimension(app, args):
     val = args.get("value")
     if val is not None and str(val) != "":
         num = float(val)
-        dim.SetSystemValue3(math.radians(num) if dim.GetType() == 1 else num / 1000,
+        dim.SetSystemValue3(math.radians(num) if v(dim, "GetType") == 1 else num / 1000,
                             get_constant("swAllConfiguration"), None)
     link = args.get("link")
     if link:
-        em = T(md.GetEquationMgr(), "IEquationMgr")
+        em = T(v(md, "GetEquationMgr"), "IEquationMgr")
         if _eq_index(em, link) < 0:
             raise ExtError(f"Global variable '{link}' not found -- add_parameter first")
         if _eq_add(em, f'"{name}" = "{link}"') < 0:
             raise ExtError(f"Could not link {name} to {link}")
-        em.EvaluateAll()
+        v(em, "EvaluateAll")
     # equation evaluation rebuilds and drops SW out of sketch edit mode --
     # put the user back in the sketch they were dimensioning
     if md.SketchManager.ActiveSketch is None:
         md.ClearSelection2(True)
         find_feature(md, sk_name).Select2(False, 0)
-        md.EditSketch()
+        v(md, "EditSketch")
         md.ClearSelection2(True)
         sk = _active_sketch(md)
     cur = dim.SystemValue
-    shown = f"{fnum(math.degrees(cur), 3)}°" if dim.GetType() == 1 else fnum(cur * 1000, 4)
+    shown = f"{fnum(math.degrees(cur), 3)}°" if v(dim, "GetType") == 1 else fnum(cur * 1000, 4)
     return _ok(f"{name} = {shown}" + (f' ("{link}")' if link else "") +
                f" -> sketch {_STATUS.get(sketch_status(sk), '?')}")
 
@@ -1278,11 +1263,11 @@ def t_add_sketch_dimension(app, args):
 def t_transaction(app, args):
     md = model(app)
     action = (args.get("action") or "begin").lower()
-    key = md.GetTitle()
+    key = v(md, "GetTitle")
     if action == "begin":
         if key in _TX:
             raise ExtError(f"Transaction '{_TX[key]['name']}' already open on {key}")
-        md.Extension.StartRecordingUndoObject()
+        v(md.Extension, "StartRecordingUndoObject")
         _TX[key] = {"name": args.get("name") or "MCP batch",
                     "feats": [f.Name for f in user_features(md)], "t": time.time()}
         return _ok(f"begin '{_TX[key]['name']}' ({len(_TX[key]['feats'])} features)")
@@ -1364,10 +1349,10 @@ def sw_hwnd(app) -> Optional[int]:
     if hwnd and _IsWindow(_w.HWND(hwnd)):
         return hwnd
     try:
-        hwnd = int(T(app.Frame(), "IFrame").GetHWndx64())
+        hwnd = int(v(T(v(app, "Frame"), "IFrame"), "GetHWndx64"))
     except Exception:
         try:
-            hwnd = int(T(app.Frame(), "IFrame").GetHWnd())
+            hwnd = int(v(T(v(app, "Frame"), "IFrame"), "GetHWnd"))
         except Exception:
             return None
     if not hwnd or not _IsWindow(_w.HWND(hwnd)):
@@ -1548,7 +1533,7 @@ def t_create_reference_axis(app, args):
     if args.get("hide"):
         md.ClearSelection2(True)
         made.Select2(False, 0)
-        md.BlankRefGeom()
+        v(md, "BlankRefGeom")
         md.ClearSelection2(True)
     return _ok(f"{made.Name}: axis from {', '.join(refs)}")
 
@@ -1584,7 +1569,7 @@ def t_mass_properties(app, args):
         raise ExtError("No solid bodies in the active document")
     mp, iface = _mass_property(md)
     try:
-        mp.Recalculate()
+        v(mp, "Recalculate")
     except Exception:
         pass
 
@@ -1641,10 +1626,9 @@ def t_get_rebuild_errors(app, args):
     errors, warnings = [], []
     for f in feats:
         try:
-            r = f.GetErrorCode2()
+            code, is_warn = error_code(f)
         except Exception:
             continue
-        code, is_warn = (r if isinstance(r, tuple) else (r, False))
         if not code:
             continue
         entry = f"{f.Name} ({v(f, 'GetTypeName2')}): {feature_error_name(code)}"
@@ -1655,7 +1639,7 @@ def t_get_rebuild_errors(app, args):
         if v(f, "GetTypeName2") != "ProfileFeature":
             continue
         try:
-            st = sketch_status(f.GetSpecificFeature2())
+            st = sketch_status(v(f, "GetSpecificFeature2"))
         except Exception:
             continue
         if st != 3:
@@ -1747,12 +1731,12 @@ def t_edit_feature(app, args):
     applied = []
     for key, num in wanted:
         dim = found[key]
-        is_angle = dim.GetType() == 1
+        is_angle = v(dim, "GetType") == 1
         dim.SetSystemValue3(math.radians(num) if is_angle else num / 1000.0,
                             all_cfg, None)
         applied.append(f"{dim.Name}={fnum(num, 4)}" + ("deg" if is_angle else ""))
 
-    md.EditRebuild3()
+    v(md, "EditRebuild3")
     errs = feature_errors(md, [f.Name for f in user_features(md)])
     msg = (f"{fname}: " + ", ".join(applied) + " | "
            + delta(app, before, snapshot(app)))
@@ -1776,10 +1760,10 @@ _STANDARD_VIEW_METHODS = {"third": "Create3rdAngleViews2", "first": "Create1stAn
 
 
 def drawing(app):
-    """Active document as typed IDrawingDoc (raises ExtError if it isn't one)."""
+    """Active document as IDrawingDoc (raises ExtError if it isn't one)."""
     md = model(app)
-    if md.GetType() != 3:
-        raise ExtError(f"Active document '{md.GetTitle()}' is not a drawing "
+    if v(md, "GetType") != 3:
+        raise ExtError(f"Active document '{v(md, "GetTitle")}' is not a drawing "
                        f"(create_drawing / open a .slddrw first)")
     return T(md, "IDrawingDoc")
 
@@ -1802,10 +1786,10 @@ def _drawing_template(app) -> Optional[str]:
 def _resolve_view_name(view: str) -> str:
     """'front' / 'Front' / '*Front' -> '*Front' (the form CreateDrawViewFromModelView3
     wants). 'current' keeps the model's last-active orientation."""
-    v = str(view or "current").strip()
-    if v.startswith("*"):
-        return v
-    return "*" + v[:1].upper() + v[1:].lower()
+    s = str(view or "current").strip()
+    if s.startswith("*"):
+        return s
+    return "*" + s[:1].upper() + s[1:].lower()
 
 
 def t_create_drawing(app, args):
@@ -1820,7 +1804,7 @@ def t_create_drawing(app, args):
         raise ExtError("NewDocument returned None for the drawing template")
     md = T(doc, "IModelDoc2")
     drw = T(doc, "IDrawingDoc")
-    return _ok(f"Created drawing: {md.GetTitle()} | sheets {drw.GetSheetCount()}")
+    return _ok(f"Created drawing: {v(md, "GetTitle")} | sheets {v(drw, "GetSheetCount")}")
 
 
 def t_add_standard_views(app, args):
@@ -1832,14 +1816,48 @@ def t_add_standard_views(app, args):
     method_name = _STANDARD_VIEW_METHODS.get(projection)
     if method_name is None:
         raise ExtError(f"Unknown projection '{projection}' (use 'first' or 'third')")
-    before = drw.GetViewCount()
-    ok = getattr(drw, method_name)(path)
+    before = v(drw, "GetViewCount")
+    # Create1st/3rdAngleViews2 return False unless the model is open in SW
+    # (confirmed 2026-09-26: closed part -> False, same part open -> 3 views).
+    # CreateDrawViewFromModelView3 has no such requirement.
+    opened_here = _ensure_model_open(app, path)
+    try:
+        ok = v(drw, method_name, path)
+    finally:
+        if opened_here:
+            _close_model_keep_drawing(app, path, drw)
     if not ok:
         raise ExtError(f"{method_name} returned False for {path} "
                        f"-- check the path and that the model rebuilds cleanly")
-    after = drw.GetViewCount()
+    after = v(drw, "GetViewCount")
     return _ok(f"{projection}-angle standard views from {os.path.basename(path)} "
-               f"| views {before}->{after}")
+               f"| views {before}->{after}" + (" (model opened and closed for it)" if opened_here else ""))
+
+
+def _ensure_model_open(app, path) -> bool:
+    """Open `path` silently if it is not open yet and give the focus back to
+    the active drawing. True if this call opened it."""
+    if v(app, "GetOpenDocumentByName", path) is not None:
+        return False
+    drawing_title = v(model(app), "GetTitle")
+    doc_type = 2 if path.lower().endswith(".sldasm") else 1
+    doc, err, _ = call_out(app, "OpenDoc6", path, doc_type, 1, "", OUT, OUT)  # swOpenDocOptions_Silent
+    if doc is None:
+        raise ExtError(f"Could not open {path} for the drawing views (error {err})")
+    call_out(app, "ActivateDoc3", drawing_title, False, 0, OUT)
+    return True
+
+
+def _close_model_keep_drawing(app, path, drw):
+    """Close a model this tool opened and give the focus back to the drawing
+    (CloseDoc activates whatever window SW picks next). The drawing keeps its
+    views; SW renames an untitled drawing after its model once views exist, so
+    the title is read again here, not remembered from before."""
+    drawing_title = v(T(drw, "IModelDoc2"), "GetTitle")
+    doc = v(app, "GetOpenDocumentByName", path)
+    if doc is not None:
+        v(app, "CloseDoc", v(doc, "GetTitle"))
+    call_out(app, "ActivateDoc3", drawing_title, False, 0, OUT)
 
 
 def t_add_drawing_view(app, args):
@@ -1850,7 +1868,7 @@ def t_add_drawing_view(app, args):
     view_name = _resolve_view_name(args.get("view"))
     x = float(args.get("x", 100)) / 1000.0
     y = float(args.get("y", 100)) / 1000.0
-    before = drw.GetViewCount()
+    before = v(drw, "GetViewCount")
     view = drw.CreateDrawViewFromModelView3(path, view_name, x, y, 0.0)
     if view is None:
         raise ExtError(
@@ -1858,12 +1876,12 @@ def t_add_drawing_view(app, args):
             f"{os.path.basename(path)} -- check the name (Front/Top/Right/Left/"
             f"Back/Bottom/Isometric/Dimetric/Trimetric/Current) and that the "
             f"model rebuilds cleanly")
-    after = drw.GetViewCount()
+    after = v(drw, "GetViewCount")
     iview = T(view, "IView")
     scale = args.get("scale")
     if scale:
         iview.ScaleDecimal = float(scale)
-    return _ok(f"Added view {iview.GetName2()!r} ({view_name}) at "
+    return _ok(f"Added view {v(iview, "GetName2")!r} ({view_name}) at "
                f"({fnum(x*1000)},{fnum(y*1000)})mm | views {before}->{after}")
 
 
@@ -1903,9 +1921,9 @@ def _view_sketch_xform(view) -> List[float]:
     ISketch.ModelToSketchTransform is exactly this sheet->sketch map (its
     'model' is the drawing sheet), scale and view rotation included, so no
     hand-rolled Position/ScaleDecimal math."""
-    sk = view.GetSketch()
+    sk = v(view, "GetSketch")
     if sk is None:
-        raise ExtError(f"View '{view.GetName2()}' has no sketch")
+        raise ExtError(f"View '{v(view, "GetName2")}' has no sketch")
     return list(T(T(sk, "ISketch").ModelToSketchTransform, "IMathTransform").ArrayData)
 
 
@@ -1946,7 +1964,7 @@ def _sketch_line_sheet(view, sm, x1, y1, x2, y2):
         raise ExtError("CreateLine returned None for the section cutting line")
     sl = T(line, "ISketchLine")
     err = 0.0
-    for pt, want in ((sl.GetStartPoint2(), (x1, y1)), (sl.GetEndPoint2(), (x2, y2))):
+    for pt, want in ((v(sl, "GetStartPoint2"), (x1, y1)), (v(sl, "GetEndPoint2"), (x2, y2))):
         sp = T(pt, "ISketchPoint")
         got = view_sketch_to_sheet(a, sp.X, sp.Y)
         err = max(err, math.hypot(got[0] - want[0], got[1] - want[1]))
@@ -1977,14 +1995,14 @@ def _discard_segment(drw, md, view_name, seg):
     try:
         drw.ActivateView(view_name)
         md.ClearSelection2(True)
-        seg.Select4(False, None)
+        seg.Select4(False, nothing())
         T(md.Extension, "IModelDocExtension").DeleteSelection2(0)
     except Exception:
         pass
 
 
 def _outline_mm(view) -> str:
-    o = view.GetOutline()
+    o = v(view, "GetOutline")
     return f"x {fnum(o[0]*1000)}..{fnum(o[2]*1000)}, y {fnum(o[1]*1000)}..{fnum(o[3]*1000)} mm"
 
 
@@ -2016,14 +2034,14 @@ def t_add_section_view(app, args):
 
     seg, err = _sketch_line_sheet(view, sm, x1, y1, x2, y2)
     md.ClearSelection2(True)
-    if not seg.Select4(False, None):
+    if not seg.Select4(False, nothing()):
         _discard_segment(drw, md, source, seg)
         raise ExtError("Could not select the cutting line after drawing it")
 
     px, py = float(args["x"]) / 1000.0, float(args["y"]) / 1000.0
     label = str(args.get("label", ""))
     depth = float(args.get("depth", 0)) / 1000.0
-    before = drw.GetViewCount()
+    before = v(drw, "GetViewCount")
     try:
         new = drw.CreateSectionViewAt5(px, py, 0.0, label, flags, None, depth)
     except Exception:
@@ -2034,10 +2052,10 @@ def t_add_section_view(app, args):
         raise ExtError(f"CreateSectionViewAt5 failed -- check that the line actually "
                        f"crosses '{source}' (x1,y1,x2,y2 are sheet mm, same space as "
                        f"add_drawing_view's x,y; the view spans {_outline_mm(view)})")
-    after = drw.GetViewCount()
+    after = v(drw, "GetViewCount")
     iview = T(new, "IView")
     warn = f" | ⚠ line landed {fnum(err, 3)}mm off the requested sheet points" if err > 0.01 else ""
-    return _ok(f"Added section view {iview.GetName2()!r} through "
+    return _ok(f"Added section view {v(iview, "GetName2")!r} through "
                f"({fnum(x1)},{fnum(y1)})-({fnum(x2)},{fnum(y2)})mm sheet "
                f"of '{source}' | views {before}->{after}{warn}")
 
@@ -2060,7 +2078,7 @@ def t_add_detail_view(app, args):
     sm = T(md.SketchManager, "ISketchManager")
     seg = _sketch_circle_sheet(view, sm, float(args["x"]), float(args["y"]), float(args["radius"]))
     md.ClearSelection2(True)
-    if not seg.Select4(False, None):
+    if not seg.Select4(False, nothing()):
         _discard_segment(drw, md, source, seg)
         raise ExtError("Could not select the detail circle after drawing it")
 
@@ -2068,7 +2086,7 @@ def t_add_detail_view(app, args):
     px, py = float(args["place_x"]) / 1000.0, float(args["place_y"]) / 1000.0
     label = str(args.get("label", ""))
 
-    before = drw.GetViewCount()
+    before = v(drw, "GetViewCount")
     try:
         new = drw.CreateDetailViewAt4(
             px, py, 0.0, style, scale, 1.0, label, 0,
@@ -2084,9 +2102,9 @@ def t_add_detail_view(app, args):
         raise ExtError(f"CreateDetailViewAt4 failed -- check that "
                        f"({fnum(args['x'])},{fnum(args['y'])})mm r={fnum(args['radius'])}mm "
                        f"actually falls on '{source}' ({_outline_mm(view)})")
-    after = drw.GetViewCount()
+    after = v(drw, "GetViewCount")
     iview = T(new, "IView")
-    return _ok(f"Added detail view {iview.GetName2()!r} of "
+    return _ok(f"Added detail view {v(iview, "GetName2")!r} of "
                f"({fnum(args['x'])},{fnum(args['y'])})mm r={fnum(args['radius'])}mm on "
                f"'{source}' at {fnum(scale)}:1 | views {before}->{after}")
 
@@ -2100,39 +2118,39 @@ def _half_depth_mm(view) -> float:
     whose axes follow the model frame."""
     rmd = T(view.ReferencedDocument, "IModelDoc2") if view.ReferencedDocument is not None else None
     if rmd is None or not is_part(rmd):
-        raise ExtError(f"View '{view.GetName2()}' does not show a part -- give depth explicitly")
+        raise ExtError(f"View '{v(view, "GetName2")}' does not show a part -- give depth explicitly")
     a = list(T(view.ModelToViewTransform, "IMathTransform").ArrayData)
     s = a[12] if len(a) > 12 and a[12] else 1.0
     zs = []
     for b in bodies(rmd):
-        bx = b.GetBodyBox()
+        bx = v(b, "GetBodyBox")
         for i in (0, 3):
             for j in (1, 4):
                 for k in (2, 5):
                     zs.append(xform(a, [bx[i], bx[j], bx[k]])[2])
     if not zs:
-        raise ExtError(f"Part in '{view.GetName2()}' has no bodies")
+        raise ExtError(f"Part in '{v(view, "GetName2")}' has no bodies")
     return (max(zs) - min(zs)) / s / 2.0 * 1000.0
 
 
 def _broken_out_names(md, view_feature: str) -> set:
     out = set()
-    f = md.FirstFeature()
+    f = v(md, "FirstFeature")
     while f is not None:
         ff = T(f, "IFeature")
-        if ff.GetTypeName2() == "DrSheet":
-            sub = ff.GetFirstSubFeature()
+        if v(ff, "GetTypeName2") == "DrSheet":
+            sub = v(ff, "GetFirstSubFeature")
             while sub is not None:
                 sf = T(sub, "IFeature")
                 if sf.Name == view_feature:
-                    ss = sf.GetFirstSubFeature()
+                    ss = v(sf, "GetFirstSubFeature")
                     while ss is not None:
                         s3 = T(ss, "IFeature")
-                        if s3.GetTypeName2() == "DrBreakoutSectionLine":
+                        if v(s3, "GetTypeName2") == "DrBreakoutSectionLine":
                             out.add(s3.Name)
-                        ss = s3.GetNextSubFeature()
-                sub = sf.GetNextSubFeature()
-        f = ff.GetNextFeature()
+                        ss = v(s3, "GetNextSubFeature")
+                sub = v(sf, "GetNextSubFeature")
+        f = v(ff, "GetNextFeature")
     return out
 
 
@@ -2152,7 +2170,7 @@ def t_add_broken_out_section(app, args):
     drw = drawing(app)
     md = model(app)
     view, fname = _find_view(drw, md, str(args["view"]))
-    disp = view.GetName2()
+    disp = v(view, "GetName2")
 
     depth = args.get("depth")
     depth_mm = float(depth) if depth not in (None, "", 0) else _half_depth_mm(view)
@@ -2165,7 +2183,7 @@ def t_add_broken_out_section(app, args):
         if len(poly) < 3:
             raise ExtError("points: need at least 3 [x,y] sheet-mm pairs for a closed contour")
     else:
-        o = [c * 1000.0 for c in view.GetOutline()]
+        o = [c * 1000.0 for c in v(view, "GetOutline")]
         mg = float(args.get("margin", 2))
         poly = [[o[0] - mg, o[1] - mg], [o[2] + mg, o[1] - mg],
                 [o[2] + mg, o[3] + mg], [o[0] - mg, o[3] + mg]]
@@ -2187,7 +2205,7 @@ def t_add_broken_out_section(app, args):
 
     md.ClearSelection2(True)
     for i, s in enumerate(segs):
-        if not s.Select4(i > 0, None):
+        if not s.Select4(i > 0, nothing()):
             for s2 in segs:
                 _discard_segment(drw, md, disp, s2)
             raise ExtError("Could not select the contour after drawing it")
@@ -2210,15 +2228,15 @@ def t_add_broken_out_section(app, args):
 
 def _all_view_names(drw) -> List[str]:
     """Every real view on the sheet (GetFirstView is the sheet itself -- skipped)."""
-    v = drw.GetFirstView()
-    if v is None:
+    vw = v(drw, "GetFirstView")
+    if vw is None:
         return []
-    v = T(v, "IView").GetNextView()
+    vw = v(T(vw, "IView"), "GetNextView")
     names = []
-    while v is not None:
-        vt = T(v, "IView")
+    while vw is not None:
+        vt = T(vw, "IView")
         names.append(vt.Name)
-        v = vt.GetNextView()
+        vw = v(vt, "GetNextView")
     return names
 
 
@@ -2268,7 +2286,7 @@ def t_insert_model_dimensions(app, args):
     _force_view_render(md)
     md.ClearSelection2(True)
     for i, name in enumerate(names):
-        if not ext_.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, i > 0, 0, None, 0):
+        if not ext_.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, i > 0, 0, nothing(), 0):
             raise ExtError(f"View '{name}' not found on the active sheet")
     drw.InsertModelDimensions(option)  # void return -- no success signal from the API itself
     md.ClearSelection2(True)
@@ -2287,26 +2305,26 @@ def t_add_note(app, args):
     to include it) but is cropped out of a PDF export -- keep x,y within the
     sheet's paper size."""
     md = model(app)
-    if md.GetType() != 3:
-        raise ExtError(f"Active document '{md.GetTitle()}' is not a drawing")
+    if v(md, "GetType") != 3:
+        raise ExtError(f"Active document '{v(md, "GetTitle")}' is not a drawing")
     text = str(args["text"])
     n = md.InsertNote(text)
     if n is None:
         raise ExtError("InsertNote returned None")
     note = T(n, "INote")
-    ann = T(note.GetAnnotation(), "IAnnotation")
+    ann = T(v(note, "GetAnnotation"), "IAnnotation")
     x, y = float(args.get("x", 100)) / 1000.0, float(args.get("y", 100)) / 1000.0
     ann.SetPosition(x, y, 0.0)
     height = args.get("height")
     if height:
         note.SetHeight(float(height) / 1000.0)
-    return _ok(f"Added note {note.GetName()!r} at ({fnum(x*1000)},{fnum(y*1000)})mm: {text[:60]!r}")
+    return _ok(f"Added note {v(note, "GetName")!r} at ({fnum(x*1000)},{fnum(y*1000)})mm: {text[:60]!r}")
 
 
 def t_export_pdf(app, args):
     md = model(app)
-    if md.GetType() != 3:
-        raise ExtError(f"Active document '{md.GetTitle()}' is not a drawing")
+    if v(md, "GetType") != 3:
+        raise ExtError(f"Active document '{v(md, "GetTitle")}' is not a drawing")
     path = str(args["path"])
     if not path.lower().endswith(".pdf"):
         raise ExtError("path must end in .pdf")
@@ -2325,15 +2343,15 @@ def t_export_pdf(app, args):
 # ----------------------------------------------------------------------------
 
 def _views(drw) -> list:
-    """Every real view on the active sheet as typed IView (the sheet itself,
+    """Every real view on the active sheet as IView (the sheet itself,
     GetFirstView, skipped)."""
     out = []
-    first = drw.GetFirstView()
-    n = T(first, "IView").GetNextView() if first is not None else None
+    first = v(drw, "GetFirstView")
+    n = v(T(first, "IView"), "GetNextView") if first is not None else None
     while n is not None:
         vt = T(n, "IView")
         out.append(vt)
-        n = vt.GetNextView()
+        n = v(vt, "GetNextView")
     return out
 
 
@@ -2344,21 +2362,21 @@ def _view_feature_names(md) -> Dict[str, str]:
     -- is 'Drawing View3' (confirmed live 2026-09-22). Read off the sheet
     feature's subfeatures, whose GetSpecificFeature2 is the IView."""
     out = {}
-    f = md.FirstFeature()
+    f = v(md, "FirstFeature")
     while f is not None:
         ff = T(f, "IFeature")
-        if ff.GetTypeName2() == "DrSheet":
-            sub = ff.GetFirstSubFeature()
+        if v(ff, "GetTypeName2") == "DrSheet":
+            sub = v(ff, "GetFirstSubFeature")
             while sub is not None:
                 sf = T(sub, "IFeature")
-                spec = sf.GetSpecificFeature2()
+                spec = v(sf, "GetSpecificFeature2")
                 if spec is not None:
                     try:
-                        out[T(spec, "IView").GetName2()] = sf.Name
+                        out[v(T(spec, "IView"), "GetName2")] = sf.Name
                     except Exception:
                         pass  # not a view (Sketch1, Plane1, Detail Folder...)
-                sub = sf.GetNextSubFeature()
-        f = ff.GetNextFeature()
+                sub = v(sf, "GetNextSubFeature")
+        f = v(ff, "GetNextFeature")
     return out
 
 
@@ -2366,37 +2384,36 @@ def _find_view(drw, md, name: str):
     """(IView, feature name) by display OR feature name."""
     fnames = _view_feature_names(md)
     for vw in _views(drw):
-        disp = vw.GetName2()
+        disp = v(vw, "GetName2")
         if name in (disp, fnames.get(disp)):
             return vw, fnames.get(disp, disp)
     have = ", ".join(f"{d!r}" + (f" (={fnames[d]!r})" if fnames.get(d, d) != d else "")
-                     for d in (vw.GetName2() for vw in _views(drw)))
+                     for d in (v(vw, "GetName2") for vw in _views(drw)))
     raise ExtError(f"No view '{name}' on the active sheet (have: {have or 'none'})")
 
 
 def t_move_drawing_view(app, args):
-    """IView.Position must be a VARIANT(VT_ARRAY|VT_R8): a plain tuple through
-    the typed wrapper is accepted without error and sets garbage -- (0.31,0.2)
-    came back as (0, 310) mm, confirmed live 2026-09-22."""
+    """IView.Position must be a VARIANT(VT_ARRAY|VT_R8) (com.double_array): a
+    plain tuple is accepted without error and sets garbage -- (0.31,0.2) came
+    back as (0, 310) mm, confirmed live 2026-09-22."""
     drw = drawing(app)
     md = model(app)
     view, _ = _find_view(drw, md, str(args["view"]))
     x, y = float(args["x"]), float(args["y"])
     before = [p * 1000 for p in view.Position]
-    view.Position = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                                            [x / 1000.0, y / 1000.0])
+    view.Position = com.double_array([x / 1000.0, y / 1000.0])
     after = [p * 1000 for p in view.Position]
     warn = ""
     if abs(after[0] - x) > 0.01 or abs(after[1] - y) > 0.01:
         warn = " | ⚠ position did not take (aligned views are locked to their parent's axis)"
-    return _ok(f"Moved '{view.GetName2()}' ({fnum(before[0])},{fnum(before[1])}) -> "
+    return _ok(f"Moved '{v(view, "GetName2")}' ({fnum(before[0])},{fnum(before[1])}) -> "
                f"({fnum(after[0])},{fnum(after[1])})mm{warn}")
 
 
 def _segment_names(view) -> set:
-    sk = view.GetSketch()
-    segs = T(sk, "ISketch").GetSketchSegments() if sk is not None else None
-    return {T(s, "ISketchSegment").GetName() for s in (segs or ())}
+    sk = v(view, "GetSketch")
+    segs = v(T(sk, "ISketch"), "GetSketchSegments") if sk is not None else None
+    return {v(T(s, "ISketchSegment"), "GetName") for s in (segs or ())}
 
 
 def t_delete_drawing_view(app, args):
@@ -2409,30 +2426,30 @@ def t_delete_drawing_view(app, args):
     md = model(app)
     ext_ = T(md.Extension, "IModelDocExtension")
     view, fname = _find_view(drw, md, str(args["view"]))
-    disp = view.GetName2()
+    disp = v(view, "GetName2")
 
     # section lines that belong to this view, per parent view, BEFORE deleting
     owned = []  # (parent IView, parent display name, section line name)
     for pv in _views(drw):
-        for s in pv.GetSectionLines() or ():
+        for s in v(pv, "GetSectionLines") or ():
             ds = T(s, "IDrSection")
-            sv = ds.GetSectionView()
-            if sv is not None and T(sv, "IView").GetName2() == disp:
-                owned.append((pv, pv.GetName2(), ds.GetName()))
+            sv = v(ds, "GetSectionView")
+            if sv is not None and v(T(sv, "IView"), "GetName2") == disp:
+                owned.append((pv, v(pv, "GetName2"), v(ds, "GetName")))
 
-    before = drw.GetViewCount()
+    before = v(drw, "GetViewCount")
     md.ClearSelection2(True)
-    if not ext_.SelectByID2(fname, "DRAWINGVIEW", 0, 0, 0, False, 0, None, 0):
+    if not ext_.SelectByID2(fname, "DRAWINGVIEW", 0, 0, 0, False, 0, nothing(), 0):
         raise ExtError(f"Could not select view '{disp}' ({fname})")
     if not ext_.DeleteSelection2(0):
         raise ExtError(f"DeleteSelection2 refused view '{disp}'")
-    after = drw.GetViewCount()
+    after = v(drw, "GetViewCount")
 
     notes = []
     for pv, pname, lname in owned:
         segs_before = _segment_names(pv)
         md.ClearSelection2(True)
-        if not (ext_.SelectByID2(lname, "SECTIONLINE", 0, 0, 0, False, 0, None, 0)
+        if not (ext_.SelectByID2(lname, "SECTIONLINE", 0, 0, 0, False, 0, nothing(), 0)
                 and ext_.DeleteSelection2(0)):
             notes.append(f"⚠ section line {lname!r} left in '{pname}'")
             continue
@@ -2440,11 +2457,11 @@ def t_delete_drawing_view(app, args):
         if loose:
             drw.ActivateView(pname)  # view-sketch segments only delete while their view is active
             md.ClearSelection2(True)
-            sk = T(pv.GetSketch(), "ISketch")
-            for s in sk.GetSketchSegments() or ():
+            sk = T(v(pv, "GetSketch"), "ISketch")
+            for s in v(sk, "GetSketchSegments") or ():
                 seg = T(s, "ISketchSegment")
-                if seg.GetName() in loose:
-                    seg.Select4(True, None)
+                if v(seg, "GetName") in loose:
+                    seg.Select4(True, nothing())
             ext_.DeleteSelection2(0)
             left = _segment_names(pv) & loose
             if left:
@@ -2462,10 +2479,10 @@ def t_delete_drawing_view(app, args):
 def _ref_part(view):
     ref = view.ReferencedDocument
     if ref is None:
-        raise ExtError(f"View '{view.GetName2()}' has no referenced model")
+        raise ExtError(f"View '{v(view, "GetName2")}' has no referenced model")
     rmd = T(ref, "IModelDoc2")
     if not is_part(rmd):
-        raise ExtError(f"View '{view.GetName2()}' shows an assembly -- edge references "
+        raise ExtError(f"View '{v(view, "GetName2")}' shows an assembly -- edge references "
                        f"are only supported for part views")
     return rmd
 
@@ -2482,7 +2499,7 @@ def _resolve_edge(view, spec):
         rows = edge_rows(rmd)
         if not 1 <= idx <= len(rows):
             raise ExtError(f"edge index {idx} out of range 1..{len(rows)} "
-                           f"(list_edges on {rmd.GetTitle()})")
+                           f"(list_edges on {v(rmd, "GetTitle")})")
         r = rows[idx - 1]
         return r["obj"], [c * 1000 for c in r["mid"]]
     p = [float(c) / 1000.0 for c in s.split(",")]
@@ -2490,14 +2507,14 @@ def _resolve_edge(view, spec):
         raise ExtError(f"edge point must be 'x,y,z' in model mm, got {spec!r}")
     best = None
     for b in bodies(rmd):
-        for eo in b.GetEdges() or ():
+        for eo in v(b, "GetEdges") or ():
             e = T(eo, "IEdge")
             q = e.GetClosestPointOn(*p)[:3]
             d = math.dist(p, q)
             if best is None or d < best[0]:
                 best = (d, e, q)
     if best is None:
-        raise ExtError(f"{rmd.GetTitle()} has no edges")
+        raise ExtError(f"{v(rmd, "GetTitle")} has no edges")
     d, e, q = best
     if d > 0.001:
         logger.info(f"edge point {spec} is {d*1000:.2f}mm from the nearest edge")
@@ -2517,7 +2534,7 @@ def _select_edges(md, view, specs) -> List[List[float]]:
     for i, spec in enumerate(specs):
         e, p = _resolve_edge(view, spec)
         if not view.SelectEntity(e, i > 0):
-            raise ExtError(f"IView.SelectEntity failed for edge {spec!r} in '{view.GetName2()}' "
+            raise ExtError(f"IView.SelectEntity failed for edge {spec!r} in '{v(view, "GetName2")}' "
                            f"(is it visible in this view?)")
         pts.append(p)
     return pts
@@ -2531,7 +2548,7 @@ def _place(ann, x, y):
 
 
 def _ann_pos(ann) -> str:
-    p = T(ann, "IAnnotation").GetPosition()
+    p = v(T(ann, "IAnnotation"), "GetPosition")
     return f"({fnum(p[0]*1000)},{fnum(p[1]*1000)})mm"
 
 
@@ -2566,7 +2583,7 @@ def t_add_drawing_dimension(app, args):
     dd = md.AddDimension2(float(x) / 1000.0, float(y) / 1000.0, 0.0)
     md.ClearSelection2(True)
     if dd is None:
-        raise ExtError(f"AddDimension2 returned None for edges {specs} in '{view.GetName2()}'")
+        raise ExtError(f"AddDimension2 returned None for edges {specs} in '{v(view, "GetName2")}'")
     D = T(dd, "IDisplayDimension")
     dim = T(D.GetDimension2(0), "IDimension")
 
@@ -2601,13 +2618,13 @@ def t_add_drawing_dimension(app, args):
             parts.append("⚠ IDimensionTolerance.SetValues failed")
         else:
             parts.append(f"tol {'+' if u >= 0 else ''}{fnum(u, 3)}/{fnum(l, 3)}")
-    md.GraphicsRedraw2()
+    v(md, "GraphicsRedraw2")
 
     val = dim.SystemValue * 1000.0
     warn = " | ⚠ value is 0 -- edges probably coincide in this view" if abs(val) < 1e-6 else ""
-    ann = D.GetAnnotation()
-    return _ok(f"Added dimension {T(ann, 'IAnnotation').GetName()!r} = {fnum(val, 3)}mm "
-               f"({dim.FullName}) in '{view.GetName2()}' at {_ann_pos(ann)}"
+    ann = v(D, "GetAnnotation")
+    return _ok(f"Added dimension {v(T(ann, 'IAnnotation'), "GetName")!r} = {fnum(val, 3)}mm "
+               f"({dim.FullName}) in '{v(view, "GetName2")}' at {_ann_pos(ann)}"
                + (f" | {prefix!r} prefix" if prefix else "")
                + "".join(f" | {p}" for p in parts) + warn)
 
@@ -2633,11 +2650,11 @@ def _gtol_symbol(sym: str, library: str) -> str:
 
 
 def _gtols(view) -> list:
-    out, g = [], view.GetFirstGTOL()
+    out, g = [], v(view, "GetFirstGTOL")
     while g is not None:
         gt = T(g, "IGtol")
         out.append(gt)
-        g = gt.GetNextGTOL()
+        g = v(gt, "GetNextGTOL")
     return out
 
 
@@ -2661,12 +2678,12 @@ def t_add_gtol(app, args):
         _select_edges(md, view, [edge])
     else:
         md.ClearSelection2(True)
-    g = md.InsertGtol()
+    g = v(md, "InsertGtol")
     md.ClearSelection2(True)
     if g is None:
         raise ExtError("InsertGtol returned None")
     G = T(g, "IGtol")
-    name = T(G.GetAnnotation(), "IAnnotation").GetName()
+    name = v(T(v(G, "GetAnnotation"), "IAnnotation"), "GetName")
 
     sym = _gtol_symbol(args["symbol"], str(args.get("library", "IGTOL")))
     G.SetFrameSymbols2(1, sym, bool(args.get("diameter", False)), "", False, "", "", "", "")
@@ -2675,19 +2692,19 @@ def t_add_gtol(app, args):
     datums += [""] * (3 - len(datums))
     if not G.SetFrameValues2(1, tolv, "", *datums):
         raise ExtError("SetFrameValues2 returned False")
-    if bool(args.get("convert", True)) and G.GetFormat() == 1:
-        G.ConvertFormat()
-        fresh = [x for x in _gtols(view) if T(x.GetAnnotation(), "IAnnotation").GetName() == name]
+    if bool(args.get("convert", True)) and v(G, "GetFormat") == 1:
+        v(G, "ConvertFormat")
+        fresh = [x for x in _gtols(view) if v(T(v(x, "GetAnnotation"), "IAnnotation"), "GetName") == name]
         G = fresh[0] if fresh else G
 
-    _place(G.GetAnnotation(), args.get("x"), args.get("y"))
+    _place(v(G, "GetAnnotation"), args.get("x"), args.get("y"))
     got_vals = G.GetFrameValues(1) or ()
     got_sym = (G.GetFrameSymbols3(1) or ("",))[0]
     warn = ""
     if (got_vals[:1] or ("",))[0] != tolv or got_sym != sym:
         warn = f" | ⚠ read back symbol={got_sym!r} values={got_vals!r}"
     return _ok(f"Added gtol {name!r} {sym} {tolv} {' '.join(d for d in datums if d)} "
-               f"in '{view.GetName2()}' (format {G.GetFormat()}) at {_ann_pos(G.GetAnnotation())}"
+               f"in '{v(view, "GetName2")}' (format {v(G, "GetFormat")}) at {_ann_pos(v(G, "GetAnnotation"))}"
                + (f" on edge {edge}" if edge not in (None, "") else "") + warn)
 
 
@@ -2698,7 +2715,7 @@ def t_add_datum(app, args):
     md = model(app)
     view, _ = _find_view(drw, md, str(args["view"]))
     _select_edges(md, view, [args["edge"]])
-    dt = md.InsertDatumTag2()
+    dt = v(md, "InsertDatumTag2")
     md.ClearSelection2(True)
     if dt is None:
         raise ExtError("InsertDatumTag2 returned None")
@@ -2706,10 +2723,10 @@ def t_add_datum(app, args):
     label = str(args.get("label", "")).strip()
     if label and not DT.SetLabel(label):
         raise ExtError(f"SetLabel({label!r}) failed")
-    ann = DT.GetAnnotation()
+    ann = v(DT, "GetAnnotation")
     _place(ann, args.get("x"), args.get("y"))
-    return _ok(f"Added datum {DT.GetLabel()!r} ({T(ann, 'IAnnotation').GetName()}) on edge "
-               f"{args['edge']} in '{view.GetName2()}' at {_ann_pos(ann)}")
+    return _ok(f"Added datum {v(DT, "GetLabel")!r} ({v(T(ann, 'IAnnotation'), "GetName")}) on edge "
+               f"{args['edge']} in '{v(view, "GetName2")}' at {_ann_pos(ann)}")
 
 
 _SF_SYMBOLS = {"basic": 0, "machined": 1, "no_machining": 2}  # swSFBasic / swSFMachining_Req / swSFDont_Machine
@@ -2759,11 +2776,11 @@ def t_add_surface_finish(app, args):
     value = str(args.get("value", ""))
     if value and not S.SetText(slot, value):
         raise ExtError(f"ISFSymbol.SetText({slot}, {value!r}) failed")
-    _place(S.GetAnnotation(), x, y)
+    _place(v(S, "GetAnnotation"), x, y)
     std_name = {0: "ISO 1302:1992", 1: "ISO 1302:2002", 2: "ISO 21920-1"}.get(std, f"#{std}")
-    return _ok(f"Added surface finish {T(S.GetAnnotation(), 'IAnnotation').GetName()!r} "
-               f"{value!r} (slot {slot}, SF standard {std_name}) in '{view.GetName2()}' "
-               f"at {_ann_pos(S.GetAnnotation())}" + (f" on edge {edge}" if attached else ""))
+    return _ok(f"Added surface finish {v(T(v(S, "GetAnnotation"), 'IAnnotation'), "GetName")!r} "
+               f"{value!r} (slot {slot}, SF standard {std_name}) in '{v(view, "GetName2")}' "
+               f"at {_ann_pos(v(S, "GetAnnotation"))}" + (f" on edge {edge}" if attached else ""))
 
 
 _ANNOTATION_KINDS = {"dimension": "DIMENSION", "datum": "DATUMTAG", "gtol": "GTOL",
@@ -2787,18 +2804,639 @@ def t_delete_annotation(app, args):
     done, missing = [], []
     for nm in names:
         md.ClearSelection2(True)
-        if ext_.SelectByID2(f"{nm}@{fname}", typ, 0, 0, 0, False, 0, None, 0) and ext_.DeleteSelection2(0):
+        if ext_.SelectByID2(f"{nm}@{fname}", typ, 0, 0, 0, False, 0, nothing(), 0) and ext_.DeleteSelection2(0):
             done.append(nm)
         else:
             missing.append(nm)
     md.ClearSelection2(True)
-    msg = f"Deleted {len(done)} {kind}(s) from '{view.GetName2()}': {', '.join(done) or '-'}"
+    msg = f"Deleted {len(done)} {kind}(s) from '{v(view, "GetName2")}': {', '.join(done) or '-'}"
     if missing:
         msg += f" | ⚠ not found as {typ} in {fname}: {', '.join(missing)}"
     return _ok(msg)
 
 
+# ============================================================================
+# Assembly tree
+# ============================================================================
+
+# swComponentSuppressionState_e
+_COMP_STATE = {0: "suppressed", 1: "lightweight", 2: "resolved", 3: "resolved",
+               4: "lightweight", 5: "lightweight"}
+
+
+class _Reader:
+    """Reads members of many objects of ONE interface with dispids looked up
+    once (one Invoke per value instead of GetIDsOfNames + Invoke). Falls back
+    to v() if an object answers differently."""
+
+    def __init__(self):
+        self._ids: Dict[str, int] = {}
+
+    def __call__(self, obj, name, *args):
+        ole = obj._oleobj_
+        dispid = self._ids.get(name)
+        if dispid is None:
+            dispid = self._ids[name] = ole.GetIDsOfNames(0, name)
+        try:
+            ret = ole.Invoke(dispid, 0, com._GET_OR_CALL, True, *args)
+        except pythoncom.com_error:
+            return v(obj, name, *args)
+        return com._good(ret, name)
+
+
+def _comp_file_code(path: str) -> str:
+    return os.path.basename(path or "") or "?"
+
+
+class _RefResolver:
+    """Where a component's file really is. A suppressed component is never
+    loaded, so GetPathName returns the path stored at the author's last save
+    (C:\\Users\\Administrator\\Desktop\\... on a model from elsewhere) --
+    os.path.exists on it says "missing" for files that sit right next to the
+    assembly (8320A-ZZ-01, 2026-09-26: 3 false alarms). SolidWorks itself
+    looks in the referencing document's folder and the top assembly's folder
+    (also under the stored path's trailing sub-folders) before the stored
+    path, and so does this:
+      ok        -- the stored path exists
+      relocated -- stale stored path, the file is found where SW will look
+      missing   -- found nowhere SW looks; `found` then holds a same-name
+                   file elsewhere under the assembly folder, if any (a hint
+                   only: SW won't pick that one up by itself)."""
+
+    _WALK_LIMIT = 20000  # files; a model folder is hundreds
+
+    def __init__(self, asm_path: str):
+        self.asm_dir = os.path.dirname(asm_path or "")
+        self._cache: Dict[tuple, tuple] = {}
+        self._index: Optional[Dict[str, str]] = None
+
+    def _by_name(self, base: str) -> str:
+        if self._index is None:
+            self._index, n = {}, 0
+            if self.asm_dir:
+                for root, _dirs, files in os.walk(self.asm_dir):
+                    for f in files:
+                        self._index.setdefault(f.lower(), os.path.join(root, f))
+                    n += len(files)
+                    if n > self._WALK_LIMIT:
+                        break
+        return self._index.get(base.lower(), "")
+
+    def __call__(self, stored: str, parent_path: str = "") -> tuple:
+        """-> (status, found_path)"""
+        if not stored:
+            return "missing", ""
+        pdir = os.path.dirname(parent_path or "")
+        key = (stored.lower(), pdir.lower())
+        hit = self._cache.get(key)
+        if hit:
+            return hit
+        if os.path.exists(stored):
+            hit = ("ok", stored)
+        else:
+            parts = [p for p in stored.replace("/", "\\").split("\\") if p]
+            dirs = list(dict.fromkeys(d for d in (pdir, self.asm_dir) if d))
+            found = next((c for d in dirs for k in range(1, min(len(parts), 3) + 1)
+                          for c in [os.path.join(d, *parts[-k:])] if os.path.exists(c)), "")
+            hit = ("relocated", found) if found else ("missing", self._by_name(parts[-1] if parts else ""))
+        self._cache[key] = hit
+        return hit
+
+
+def t_get_assembly_tree(app, args):
+    """Component tree of the active assembly from one flat GetComponents call
+    (hierarchy from the 'parent-1/child-1' instance paths -- a recursive
+    GetChildren walk timed out on an 844-component assembly)."""
+    md = model(app)
+    if v(md, "GetType") != 2:
+        raise ExtError("Active document is not an assembly (get_assembly_tree needs a .sldasm)")
+    t0 = time.time()
+    mode = str(args.get("mode", "tree")).lower()
+    max_depth = int(args.get("max_depth") or 0)
+    max_lines = int(args.get("max_lines") or 150)
+    details = bool(args.get("details", False))
+    out_path = str(args.get("output_path") or "").strip()
+
+    budget = float(args.get("time_budget_s") or 40)
+    asm = T(md, "IAssemblyDoc")
+    comps = v(asm, "GetComponents", bool(args.get("top_level_only", False))) or ()
+    t_list = time.time() - t0
+    rd = _Reader()
+    # Every member read is a cross-process Invoke (~4 ms each on SW 2026 with
+    # an 844-component assembly), so read Name2 first -- it alone gives level
+    # and parent -- and the rest only for components inside max_depth, within
+    # a time budget (the MCP client gives up after ~60 s).
+    named = [(c, rd(c, "Name2")) for c in comps]
+    rows, partial = [], False
+    for c, name in named:
+        level = name.count("/") + 1
+        if max_depth and level > max_depth:
+            continue
+        if time.time() - t0 > budget:
+            partial = True
+            break
+        path = rd(c, "GetPathName") or ""
+        row = {"name": name, "level": level,
+               "parent": name.rsplit("/", 1)[0] if "/" in name else "",
+               "file": _comp_file_code(path), "path": path,
+               "asm": path.lower().endswith(".sldasm"),
+               "state": _COMP_STATE.get(rd(c, "GetSuppression2"), "?")}
+        if details:
+            row["config"] = rd(c, "ReferencedConfiguration")
+            row["fixed"] = bool(rd(c, "IsFixed"))
+            row["hidden"] = not bool(rd(c, "Visible"))
+            row["virtual"] = bool(rd(c, "IsVirtual"))
+            row["exclude_bom"] = bool(rd(c, "ExcludeFromBOM"))
+        rows.append(row)
+    all_levels = [n.count("/") + 1 for _, n in named]
+    t_read = time.time() - t0
+
+    by_name = {r["name"]: r for r in rows}
+    # Parents before children: a child inherits suppression from any
+    # ancestor, and its file is searched next to the parent's real file.
+    resolve = _RefResolver(v(md, "GetPathName"))
+    for r in sorted(rows, key=lambda r: r["level"]):
+        p = by_name.get(r["parent"])
+        r["suppressed"] = r["state"] == "suppressed" or bool(p and p["suppressed"])
+        r["path_status"], found = resolve(r["path"], (p.get("found_path") or p["path"]) if p else "")
+        if r["path_status"] != "ok" and found:
+            r["found_path"] = found
+    files = {r["file"]: r["asm"] for r in rows}
+    active_files = {r["file"] for r in rows if not r["suppressed"]}
+    missing = sorted({r["file"] for r in rows if r["path_status"] == "missing"})
+    relocated = sorted({r["file"] for r in rows if r["path_status"] == "relocated"} - set(missing))
+    elsewhere = sorted({r["file"] for r in rows if r["path_status"] == "missing" and r.get("found_path")})
+    n_supp = sum(r["suppressed"] for r in rows)
+    depth = max(all_levels, default=0)
+    states = {}
+    for r in rows:
+        states[r["state"]] = states.get(r["state"], 0) + 1
+
+    total = len(named)
+    head = (f"{v(md, 'GetTitle')}: {total} instances"
+            + (f" ({len(rows)} within depth {max_depth})" if max_depth and len(rows) != total else "")
+            + f", {len(files)} unique files "
+            f"({sum(1 for a in files.values() if not a)} parts, {sum(1 for a in files.values() if a)} "
+            f"assemblies"
+            + (f"; {len(files) - len(active_files)} only in suppressed instances" if len(active_files) != len(files) else "")
+            + f"), depth {depth} | " + ", ".join(f"{k} {n}" for k, n in sorted(states.items())))
+    if n_supp != states.get("suppressed", 0):
+        head += f" (+{n_supp - states.get('suppressed', 0)} inside suppressed sub-assemblies)"
+    if details:
+        head += (f" | fixed {sum(r['fixed'] for r in rows)}, hidden {sum(r['hidden'] for r in rows)}, "
+                 f"virtual {sum(r['virtual'] for r in rows)}, excluded from BOM "
+                 f"{sum(r['exclude_bom'] for r in rows)}")
+
+    def _names(fs):
+        return f"{len(fs)} ({', '.join(fs[:5])}{'...' if len(fs) > 5 else ''})"
+    if missing:
+        head += f" | ⚠ missing on disk: {_names(missing)}"
+        if elsewhere:
+            head += (f", same name elsewhere under the assembly folder (SW won't find it itself): "
+                     f"{_names(elsewhere)}")
+    if relocated:
+        head += (f" | stale stored path (author's machine), file found next to the assembly: "
+                 f"{_names(relocated)}")
+    head += f" | read {t_read:.1f}s (list {t_list:.1f}s)"
+    if partial:
+        head += (f" | ⚠ time budget {budget:.0f}s reached: {len(rows)} of {total} components read -- "
+                 f"use max_depth, top_level_only, or raise time_budget_s")
+
+    lines = []
+    if mode == "flat":
+        # unique files: active qty (+ suppressed apart), levels, parents -- a
+        # BOM skeleton. Suppressed = own state or inside a suppressed
+        # sub-assembly; counting them in ×N inflated the BOM (8200-16-10
+        # pulley showed ×4 with all 4 suppressed).
+        agg: Dict[str, Dict] = {}
+        for r in rows:
+            a = agg.setdefault(r["file"], {"qty": 0, "supp": 0, "levels": set(), "parents": {},
+                                           "asm": r["asm"]})
+            a["supp" if r["suppressed"] else "qty"] += 1
+            a["levels"].add(r["level"])
+            pf = by_name[r["parent"]]["file"] if r["parent"] in by_name else "<top>"
+            a["parents"][pf] = a["parents"].get(pf, 0) + 1
+        lines.append("(×N = active instances; suppressed ones counted apart, parents count both)")
+        for f, a in sorted(agg.items(), key=lambda kv: (not kv[1]["asm"], kv[0].lower())):
+            if max_depth and min(a["levels"]) > max_depth:
+                continue
+            lines.append(f"{'A' if a['asm'] else 'P'} {f} ×{a['qty']}"
+                         + (f" (+{a['supp']} suppressed)" if a["supp"] else "")
+                         + f" L{','.join(map(str, sorted(a['levels'])))} "
+                         f"in {', '.join(f'{p}×{n}' for p, n in a['parents'].items())}")
+    else:
+        # indented tree; identical sibling files collapsed to "×N"
+        children: Dict[str, List[dict]] = {}
+        for r in rows:
+            children.setdefault(r["parent"], []).append(r)
+
+        def walk(parent, indent):
+            groups: Dict[str, List[dict]] = {}
+            for r in children.get(parent, []):
+                groups.setdefault(r["file"], []).append(r)
+            for f, rs in groups.items():
+                # show the structure of an active instance if there is one
+                # (a suppressed sub-assembly has no children to walk)
+                r = next((x for x in rs if not x["suppressed"]), rs[0])
+                if max_depth and r["level"] > max_depth:
+                    continue
+                st: Dict[str, int] = {}
+                for x in rs:
+                    st[x["state"]] = st.get(x["state"], 0) + 1
+                if len(st) == 1:
+                    flag = "" if r["state"] == "resolved" else f" [{r['state']}]"
+                else:  # mixed group: say how many of the ×N are what
+                    flag = " [" + ", ".join(f"{n} {s}" for s, n in sorted(st.items()) if s != "resolved") + "]"
+                if details:
+                    flag += "".join(f" [{k}]" for k in ("fixed", "hidden", "virtual") if any(x[k] for x in rs))
+                lines.append(f"{'  ' * indent}{f}{' ×' + str(len(rs)) if len(rs) > 1 else ''}{flag}")
+                if r["asm"]:
+                    walk(r["name"], indent + 1)  # siblings of one file share structure
+
+        walk("", 0)
+
+    shown = lines[:max_lines]
+    text = head + "\n" + "\n".join(shown)
+    if len(lines) > max_lines:
+        text += f"\n... {len(lines) - max_lines} more lines (raise max_lines, lower max_depth, or use output_path)"
+    if out_path:
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"assembly": v(md, "GetPathName"), "instances": rows}, fh,
+                      ensure_ascii=False, indent=0)
+        text += f"\nfull instance list ({len(rows)}) -> {out_path}"
+    return _ok(text)
+
+
+# ============================================================================
+# Component properties (custom properties, material, mass) per unique file
+# ============================================================================
+
+# Custom property names that hold the drawing / part number and the material
+# (compared case-insensitively, surrounding spaces ignored).
+_DRAWING_NO_PROPS = ("图号", "partno", "part no", "part number", "partnumber", "number",
+                     "零件号", "代号", "обозначение")
+_MATERIAL_PROPS = ("material", "材料", "材质", "материал")
+_SW_LOADED = (2, 3)  # swComponentResolved / swComponentFullyResolved
+
+# Worklists of recent calls, so a cursor continuation doesn't re-read every
+# component (~10 ms per COM call on a loaded assembly). Lost on reload_api,
+# then rebuilt and checked against the cursor's fingerprint.
+_CP_WORK: Dict[str, dict] = {}
+
+
+class _Raw:
+    """IDispatch::Invoke on raw PyIDispatch with dispids cached per
+    (role, member). v() pays GetIDsOfNames on every call and wraps every
+    returned object in dynamic.Dispatch (more cross-process typeinfo calls):
+    ~190 ms per file vs ~90 ms this way on 8320A-ZZ-01. Roles keep dispids of
+    different COM classes apart (a part and an assembly document)."""
+
+    def __init__(self):
+        self._ids: Dict[tuple, int] = {}
+
+    def __call__(self, ole, role: str, name: str, *args):
+        ole = getattr(ole, "_oleobj_", ole)
+        key = (role, name)
+        d = self._ids.get(key)
+        if d is None:
+            d = self._ids[key] = ole.GetIDsOfNames(0, name)
+        return ole.Invoke(d, 0, com._GET_OR_CALL, True, *args)
+
+    def put(self, ole, role: str, name: str, value):
+        ole = getattr(ole, "_oleobj_", ole)
+        key = (role, name)
+        d = self._ids.get(key)
+        if d is None:
+            d = self._ids[key] = ole.GetIDsOfNames(0, name)
+        ole.Invoke(d, 0, pythoncom.DISPATCH_PROPERTYPUT, False, value)
+
+
+def _cp_type_names() -> Dict[int, str]:
+    try:
+        from .utils.typelib import enum_values
+        return {x: n.replace("swCustomInfo", "").lower()
+                for n, x in enum_values("swCustomInfoType_e").items()}
+    except Exception:
+        return {}
+
+
+def _cp_read(rd: _Raw, x, cfg: str, tnames: Dict[int, str]) -> Dict[str, dict]:
+    """All custom properties of one configuration ('' = file level).
+
+    GetAll3 returns names, types, RESOLVED values, a swCustomInfoGetResult_e
+    per property (not the text!) and link flags -- the unevaluated expression
+    ('"SW-Mass@Part1.SLDPRT"') is not in it. The legacy GetAll returns the
+    raw values in the same order, so value + resolved cost two calls, not
+    one Get6 per property. Checked live 2026-09-26 on a scratch part."""
+    cp = rd(x, "ext", "CustomPropertyManager", cfg)
+    if cp is None:
+        return {}
+    o3 = [com.out_variant() for _ in range(5)]
+    n = rd(cp, "cpm", "GetAll3", *o3)
+    if not n:
+        return {}
+    names, types, resolved, _res, links = (tuple(o.value or ()) for o in o3)
+    o1 = [com.out_variant() for _ in range(3)]
+    rd(cp, "cpm", "GetAll", *o1)
+    raw = dict(zip(tuple(o1[0].value or ()), tuple(o1[2].value or ())))
+    out = {}
+    for i, name in enumerate(names):
+        p = {"value": raw.get(name, resolved[i] if i < len(resolved) else ""),
+             "resolved": resolved[i] if i < len(resolved) else "",
+             "type": tnames.get(types[i], types[i]) if i < len(types) else "?"}
+        if i < len(links) and links[i]:
+            p["linked"] = True
+        out[name] = p
+    return out
+
+
+def _cp_pick(props_list, keys) -> tuple:
+    """(name, resolved value) of the first property matching `keys`, searching
+    the dicts in order (config-specific before file level)."""
+    for props in props_list:
+        for name, p in props.items():
+            if name.strip().lower() in keys and str(p.get("resolved", "")).strip():
+                return name, str(p["resolved"]).strip()
+    return "", ""
+
+
+def _cp_norm(s: str) -> str:
+    return "".join(str(s).split()).casefold()
+
+
+def _cp_worklist(app, md, include_suppressed: bool) -> dict:
+    """Unique component files of the active assembly with active/suppressed
+    quantities, parents and their instances. One GetComponents call; per
+    instance Name2 / GetPathName / GetSuppression2 (as get_assembly_tree)."""
+    asm = T(md, "IAssemblyDoc")
+    comps = v(asm, "GetComponents", False) or ()
+    rd = _Reader()
+    inst = []
+    for c in comps:
+        inst.append({"c": c, "name": rd(c, "Name2"), "path": rd(c, "GetPathName") or "",
+                     "state": rd(c, "GetSuppression2")})
+    by_name = {i["name"]: i for i in inst}
+    # Group by the file SW would really use: a suppressed instance keeps the
+    # author's stale path (982S-02 on 8320A-ZZ-01: one active instance at the
+    # real path, one suppressed at C:\Users\Administrator\... -- same file,
+    # which grouping by stored path counted as two).
+    resolve = _RefResolver(v(md, "GetPathName"))
+    for i in sorted(inst, key=lambda i: i["name"].count("/")):
+        p = by_name.get(i["name"].rsplit("/", 1)[0]) if "/" in i["name"] else None
+        i["supp"] = i["state"] == 0 or bool(p and p["supp"])
+        i["parent"] = _comp_file_code(p["path"]) if p else "<top>"
+        status, found = resolve(i["path"], p["real"] if p else "")
+        i["real"] = found if status == "relocated" else i["path"]
+    files: Dict[str, dict] = {}
+    for i in inst:
+        f = files.setdefault(i["real"].lower(), {
+            "file": _comp_file_code(i["real"]), "path": i["real"],
+            "type": "assembly" if i["real"].lower().endswith(".sldasm") else "part",
+            "qty_active": 0, "qty_suppressed": 0, "parents": {}, "inst": []})
+        f["qty_suppressed" if i["supp"] else "qty_active"] += 1
+        f["parents"][i["parent"]] = f["parents"].get(i["parent"], 0) + 1
+        f["inst"].append(i)
+        if i["path"] != i["real"]:
+            f.setdefault("stored_paths", [])
+            if i["path"] not in f["stored_paths"]:
+                f["stored_paths"].append(i["path"])
+    keys = sorted(files)
+    work = [files[k] for k in keys if include_suppressed or files[k]["qty_active"]]
+    return {"asm": v(md, "GetPathName"), "work": work,
+            "skipped": len(keys) - len(work), "n_inst": len(inst)}
+
+
+def _cp_fingerprint(wl: dict, settings: dict) -> str:
+    h = hashlib.sha1(json.dumps([wl["asm"].lower(), settings,
+                                 [(w["path"].lower(), w["qty_active"], w["qty_suppressed"])
+                                  for w in wl["work"]]], ensure_ascii=False).encode("utf-8"))
+    return h.hexdigest()[:10]
+
+
+def _cp_file(rd: _Raw, w: dict, idx: int, settings: dict, tnames, resolve) -> dict:
+    """One JSONL row. Only reads: GetModelDoc2 of an already loaded
+    instance; a lightweight / suppressed file is reported, never resolved."""
+    row = {"kind": "file", "i": idx, "file": w["file"], "path": w["path"], "type": w["type"],
+           "qty_active": w["qty_active"], "qty_suppressed": w["qty_suppressed"],
+           "parents": w["parents"]}
+    if w.get("stored_paths"):
+        row["stored_paths"] = w["stored_paths"]
+    live = [i for i in w["inst"] if not i["supp"] and i["state"] in _SW_LOADED]
+    if not live and settings["include_suppressed"]:
+        live = [i for i in w["inst"] if i["state"] in _SW_LOADED]
+    doc = rd(live[0]["c"], "comp", "GetModelDoc2") if live else None
+    if doc is None:
+        states = sorted({_COMP_STATE.get(i["state"], "?") for i in w["inst"]})
+        status, _found = resolve(w["inst"][0]["path"])
+        row.update(status="not_loaded",
+                   reason=("all instances suppressed" if all(i["supp"] for i in w["inst"])
+                           else "no resolved instance") + f" (states: {', '.join(states)})",
+                   path_status=status)
+        if _found and status != "ok":
+            row["found_path"] = _found
+        return row
+
+    role = "asm" if w["type"] == "assembly" else "part"
+    x = rd(doc, role, "Extension")
+    cfg_mode = settings["config"]
+    if cfg_mode == "active":
+        seen = {}
+        for i in live:
+            c = rd(i["c"], "comp", "ReferencedConfiguration") or ""
+            seen[c] = seen.get(c, 0) + 1
+        configs = sorted(seen, key=lambda c: -seen[c])   # most used first
+    elif cfg_mode == "all":
+        configs = list(rd(doc, role, "GetConfigurationNames") or ())
+    elif cfg_mode == "none":
+        configs = []
+    else:
+        configs = [cfg_mode]
+    row["configs"] = configs
+    file_props = _cp_read(rd, x, "", tnames)
+    cfg_props = {c: _cp_read(rd, x, c, tnames) for c in configs}
+    row["props"] = {"file": file_props, "config": cfg_props}
+    primary = configs[0] if configs else ""
+    search = [cfg_props.get(primary, {}), file_props]
+    row["drawing_no"] = _cp_pick(search, _DRAWING_NO_PROPS)[1]
+    pname, pval = _cp_pick(search, _MATERIAL_PROPS)
+
+    if w["type"] == "part":
+        mats = {}
+        for c in (configs or [""]):
+            mo = com.out_str()
+            mats[c] = (rd(doc, role, "GetMaterialPropertyName2", c, mo) or "", mo.value or "")
+        sw_mat, db = mats[primary]
+        row["material"] = {"sw": sw_mat, "db": db, "config": primary,
+                           "property": pval, "property_name": pname}
+        other = {c: m[0] for c, m in mats.items() if c != primary and m[0] != sw_mat}
+        if other:
+            row["material"]["other_configs"] = other
+        row["no_material"] = not sw_mat
+        row["material_mismatch"] = bool(sw_mat and pval and _cp_norm(sw_mat) != _cp_norm(pval))
+        if settings["include_mass"]:
+            mp = rd(x, "ext", "CreateMassProperty")
+            if mp is not None:
+                try:
+                    rd.put(mp, "mass", "UseSystemUnits", True)
+                except pythoncom.com_error:
+                    pass
+                row["mass_kg"] = float(rd(mp, "mass", "Mass"))
+                row["volume_mm3"] = float(rd(mp, "mass", "Volume")) * 1e9
+    elif pval:
+        row["material"] = {"property": pval, "property_name": pname}
+    row["status"] = "ok"
+    return row
+
+
+def _cp_summary(rows: List[dict], skipped: int, include_mass: bool) -> dict:
+    ok = [r for r in rows if r.get("status") == "ok"]
+    parts = [r for r in ok if r["type"] == "part"]
+    nums: Dict[str, List[str]] = {}
+    for r in ok:
+        n = (r.get("drawing_no") or "").strip()
+        if n:
+            nums.setdefault(n, []).append(r["file"])
+    dups = {n: fs for n, fs in sorted(nums.items()) if len(fs) > 1}
+    s = {"kind": "summary", "files": len(rows),
+         "parts": sum(r["type"] == "part" for r in rows),
+         "assemblies": sum(r["type"] == "assembly" for r in rows),
+         "ok": len(ok),
+         "not_loaded": sum(r.get("status") == "not_loaded" for r in rows),
+         "errors": sum(r.get("status") == "error" for r in rows),
+         "no_material": sum(bool(r.get("no_material")) for r in parts),
+         "material_mismatch": sum(bool(r.get("material_mismatch")) for r in parts),
+         "mismatch_files": [f"{r['file']}: SW {r['material']['sw']!r} vs "
+                            f"{r['material']['property_name']} {r['material']['property']!r}"
+                            for r in parts if r.get("material_mismatch")],
+         "drawing_no_duplicates": dups,
+         "skipped_suppressed_only": skipped}
+    if include_mass:
+        s["mass_active_kg"] = round(sum(r.get("mass_kg", 0.0) * r["qty_active"] for r in parts), 4)
+    return s
+
+
+def t_get_component_properties(app, args):
+    """Custom properties, material and (optionally) mass of every unique
+    component file of the active assembly, streamed to JSONL within a time
+    budget and resumable by cursor. Read-only: documents come from
+    Component2.GetModelDoc2 of instances already loaded in the assembly."""
+    t0 = time.time()
+    md = model(app)
+    if v(md, "GetType") != 2:
+        raise ExtError("Active document is not an assembly (get_component_properties needs a .sldasm)")
+    out_path = str(args.get("output_path") or "").strip()
+    if not out_path:
+        raise ExtError("output_path (.jsonl) is required")
+    budget = float(args.get("budget_s") or 45)
+    cursor = str(args.get("cursor") or "").strip()
+    cfg = str(args.get("config") if args.get("config") is not None else "active").strip() or "none"
+    settings = {"config": cfg,
+                "include_mass": bool(args.get("include_mass", False)),
+                "include_suppressed": bool(args.get("include_suppressed", False))}
+
+    wl = None
+    start = 0
+    if cursor:
+        try:
+            start_s, _total, fp = cursor.split("/")
+            start = int(start_s)
+        except ValueError:
+            raise ExtError(f"Bad cursor {cursor!r} (expected 'next/total/fingerprint' from the previous call)")
+        wl = _CP_WORK.get(fp)
+    if wl is None:
+        wl = _cp_worklist(app, md, settings["include_suppressed"])
+    fp_now = _cp_fingerprint(wl, settings)
+    if cursor and fp_now != fp:
+        raise ExtError("cursor does not match the assembly / settings / component list any more "
+                       "(different config/include_* arguments, another active assembly, or the "
+                       "structure changed) -- start over without cursor")
+    _CP_WORK.clear()
+    _CP_WORK[fp_now] = wl
+    work = wl["work"]
+    t_list = time.time() - t0
+
+    header = {"kind": "header", "assembly": wl["asm"], **settings, "files": len(work),
+              "instances": wl["n_inst"], "skipped_suppressed_only": wl["skipped"],
+              "fingerprint": fp_now}
+    done_keys, rows_before = set(), []
+    if cursor:
+        if not os.path.exists(out_path):
+            raise ExtError(f"cursor given but {out_path} does not exist -- start over without cursor")
+        with open(out_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                if r.get("kind") == "header" and r.get("fingerprint") != fp_now:
+                    raise ExtError(f"{out_path} belongs to another run (fingerprint "
+                                   f"{r.get('fingerprint')} != {fp_now}) -- start over without cursor")
+                if r.get("kind") == "file":
+                    done_keys.add(r["path"].lower())
+                    rows_before.append(r)
+                elif r.get("kind") == "summary":
+                    raise ExtError(f"{out_path} is already complete (has a summary line)")
+        mode = "a"
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+        mode = "w"
+
+    rd = _Raw()
+    tnames = _cp_type_names()
+    resolve = _RefResolver(wl["asm"])
+    new_rows, i = [], start
+    with open(out_path, mode, encoding="utf-8", newline="\n") as fh:
+        if mode == "w":
+            fh.write(json.dumps(header, ensure_ascii=False) + "\n")
+        while i < len(work):
+            # at least one file per call, so a tiny budget still progresses
+            if new_rows and time.time() - t0 > budget:
+                break
+            w = work[i]
+            if w["path"].lower() not in done_keys:
+                try:
+                    row = _cp_file(rd, w, i, settings, tnames, resolve)
+                except Exception as e:
+                    row = {"kind": "file", "i": i, "file": w["file"], "path": w["path"],
+                           "type": w["type"], "qty_active": w["qty_active"],
+                           "qty_suppressed": w["qty_suppressed"], "parents": w["parents"],
+                           "status": "error", "error": f"{type(e).__name__}: {e}"}
+                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                fh.flush()
+                new_rows.append(row)
+                done_keys.add(w["path"].lower())
+            i += 1
+        done = i >= len(work)
+        summary = None
+        if done:
+            summary = _cp_summary(rows_before + new_rows, wl["skipped"], settings["include_mass"])
+            fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+    el = time.time() - t0
+    if not done:
+        nxt = f"{i}/{len(work)}/{fp_now}"
+        return _ok(f"done:false | {len(new_rows)} file(s) this call, {i}/{len(work)} total, "
+                   f"{len(work) - i} remaining | {el:.1f}s (component list {t_list:.1f}s) -> {out_path}\n"
+                   f"call again with cursor={nxt!r} (same output_path and arguments)",
+                   {"done": False, "cursor": nxt, "processed": i, "remaining": len(work) - i})
+    s = summary
+    dups = s["drawing_no_duplicates"]
+    msg = (f"done:true | {s['files']} files ({s['parts']} parts, {s['assemblies']} assemblies), "
+           f"ok {s['ok']}, not_loaded {s['not_loaded']}, errors {s['errors']}"
+           + (f", skipped {s['skipped_suppressed_only']} suppressed-only" if s["skipped_suppressed_only"] else "")
+           + f" | no SW material {s['no_material']} parts, material mismatch {s['material_mismatch']}"
+           + f" | drawing no. duplicates {len(dups)}"
+           + (f" ({'; '.join(f'{n}: {len(fs)} files' for n, fs in list(dups.items())[:5])})" if dups else "")
+           + (f" | mass of active parts {s['mass_active_kg']} kg" if "mass_active_kg" in s else "")
+           + f" | this call {len(new_rows)} file(s), {el:.1f}s -> {out_path}")
+    return _ok(msg, {"done": True, "summary": {k: v_ for k, v_ in s.items()
+                                                if k not in ("kind", "mismatch_files")}})
+
+
 HANDLERS = {
+    "get_assembly_tree": t_get_assembly_tree,
+    "get_component_properties": t_get_component_properties,
     "inspect": t_inspect,
     "list_faces": t_list_faces,
     "list_edges": t_list_edges,
@@ -2897,6 +3535,44 @@ _EDGE_DESC = ("Edge of the part shown in the view: an index from list_edges on t
               "or a model point 'x,y,z' in part mm -- the nearest edge to it is used")
 
 TOOL_SCHEMAS = [
+    ("get_assembly_tree",
+     "Component tree of the active assembly: header with instance / unique-file / part / sub-assembly "
+     "counts, depth, resolved-lightweight-suppressed states, files really missing on disk vs stale stored "
+     "paths whose file sits next to the assembly, then either an indented tree (identical siblings "
+     "collapsed to xN, quantities per parent) or a flat list of unique files with active quantity, "
+     "suppressed quantity apart, levels and parents (a BOM skeleton). output_path writes every instance "
+     "(with suppressed / path_status / found_path) to JSON for further processing.",
+     _obj({"mode": {"type": "string", "enum": ["tree", "flat"], "default": "tree"},
+           "max_depth": {"type": "integer", "default": 0, "description": "0 = all levels"},
+           "max_lines": {"type": "integer", "default": 150},
+           "details": {"type": "boolean", "default": False,
+                       "description": "Also read config, fixed/float, hidden, virtual, excluded-from-BOM"},
+           "top_level_only": {"type": "boolean", "default": False},
+           "time_budget_s": {"type": "number", "default": 40,
+                             "description": "Stop reading and report partial after this many seconds "
+                                            "(~4 ms per component property on SW 2026)"},
+           "output_path": {"type": "string", "description": "Optional .json path for the full instance list"}})),
+    ("get_component_properties",
+     "Custom properties (file-level and configuration, value + resolved), SW material vs the "
+     "Material/材料 property, optional mass -- per UNIQUE component file of the active assembly, "
+     "one JSON line per file in output_path. Read-only: uses documents already loaded in the "
+     "assembly; lightweight/suppressed files get status not_loaded. Stops at budget_s and returns "
+     "done:false + cursor; call again with the same output_path/arguments and that cursor to continue "
+     "(appends, no duplicates). done:true returns a summary: files, not_loaded, no material, material "
+     "mismatches, duplicate drawing numbers (图号/PartNo/Number).",
+     _obj({"output_path": {"type": "string", "description": "JSONL file (overwritten on a call without cursor)"},
+           "budget_s": {"type": "number", "default": 45,
+                        "description": "Stop after this many seconds (at least one file per call)"},
+           "cursor": {"type": "string", "description": "From a previous done:false answer"},
+           "include_mass": {"type": "boolean", "default": False,
+                            "description": "Also mass/volume per part (IMassProperty)"},
+           "include_suppressed": {"type": "boolean", "default": False,
+                                  "description": "Also list files that occur only in suppressed "
+                                                 "instances (as not_loaded)"},
+           "config": {"type": "string", "default": "active",
+                      "description": "Configuration properties to read: 'active' = the configuration(s) "
+                                     "the assembly references, 'all', 'none' (file-level only) or a name"}},
+          ["output_path"])),
     ("inspect",
      "One-call snapshot of the active part: volume, area, bbox, face-type histogram, "
      "feature tree, active sketch + its frame. Use instead of several diagnostic calls.",

@@ -35,7 +35,10 @@ from mcp.types import Tool, TextContent
 from .automation import SolidWorksAutomation
 from .constants import SwErrors
 from .config import get_config, save_config
-from .utils import get_solidworks_info, set_default_unit, com_get, get_signature, get_constant
+# Modules, not names: `from .utils import get_signature` pins the function
+# object that existed when server.py was imported, and server.py is never
+# reloaded -- reload_api then left lookup_api_signature on the old code.
+from .utils import sw_finder, units, com_helpers, typelib
 from . import ext
 from . import toolsets
 
@@ -91,11 +94,16 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="open_document",
-            description="Open an existing SolidWorks document.",
+            description="Open an existing SolidWorks document (silent). Reports decoded load "
+                        "errors/warnings; for an assembly also component counts, how many came in "
+                        "lightweight (Large Assembly Mode) and resolves them unless told not to.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "filepath": {"type": "string", "description": "Path to file"}
+                    "filepath": {"type": "string", "description": "Path to file"},
+                    "resolve_lightweight": {"type": "boolean", "default": True,
+                                            "description": "Assemblies: resolve lightweight components after opening"},
+                    "read_only": {"type": "boolean", "default": False}
                 },
                 "required": ["filepath"]
             }
@@ -388,9 +396,12 @@ async def list_tools() -> list[Tool]:
             name="execute_python",
             description=(
                 "Execute Python against the live SolidWorks connection; print() your results. "
-                "Pre-bound (fresh each call): sw (app), doc (ActiveDoc, dynamic), md (typed IModelDoc2), "
-                "T(obj,'IFace2') typed wrapper, v(obj,'Member') call-or-read, ext (helpers: face_rows, "
-                "edge_rows, select_entities, find_feature, snapshot, delta...), g (com_get), math, json. "
+                "Everything is late-bound (dynamic dispatch; never gencache/EnsureDispatch). "
+                "Pre-bound (fresh each call): sw (app), doc (ActiveDoc), md (doc as IModelDoc2), "
+                "T(obj,'IFace2') = QueryInterface, v(obj,'Member',*args) read/call -- use it for zero-arg "
+                "methods (obj.GetTitle() fails), call_out(obj,'M',..,OUT,OUT) -> (ret,*outs) for by-ref "
+                "out params, nothing() for a null object arg, com (out_int/out_bool/... helpers), "
+                "ext (face_rows, edge_rows, select_entities, find_feature, snapshot, delta...), math, json. "
                 "Variables you assign persist between calls. SW API units are metres/radians."
             ),
             inputSchema={
@@ -518,7 +529,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = sw_automation.connect()
         
         elif name == "get_solidworks_info":
-            info = get_solidworks_info()
+            info = sw_finder.get_solidworks_info()
             result = {
                 "success": info["found"],
                 "message": f"SolidWorks {'found' if info['found'] else 'not found'}",
@@ -535,7 +546,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = sw_automation.create_new_assembly()
         
         elif name == "open_document":
-            result = sw_automation.open_document(arguments.get("filepath", ""))
+            result = sw_automation.open_document(
+                arguments.get("filepath", ""),
+                resolve_lightweight=bool(arguments.get("resolve_lightweight", True)),
+                read_only=bool(arguments.get("read_only", False)))
         
         elif name == "save_document":
             result = sw_automation.save_document(arguments.get("filepath"))
@@ -673,7 +687,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Utility Tools
         elif name == "set_units":
             unit = arguments.get("unit", "mm")
-            set_default_unit(unit)
+            units.set_default_unit(unit)
             sw_automation._units.default_unit = unit
             result = {
                 "success": True,
@@ -760,17 +774,22 @@ def _execute_python_fixed(code: str) -> Dict:
     import os as os_module
     import win32com.client
     import pythoncom
+    from .utils import com_helpers as com
 
     app = sw_automation.app
-    doc = app.ActiveDoc if app else None
+    doc = com.v(app, "ActiveDoc") if app else None
     _PY_NS.update({
         "sw": app,
         "doc": doc,
         "md": ext.T(doc, "IModelDoc2") if doc is not None else None,
         "T": ext.T,
-        "v": ext.v,
+        "v": com.v,
+        "com": com,
+        "nothing": com.nothing,
+        "OUT": com.OUT,
+        "call_out": com.call_out,
         "ext": ext,
-        "g": com_get,
+        "g": com_helpers.com_get,
         "automation": sw_automation,
         "win32com": win32com,
         "pythoncom": pythoncom,
@@ -813,8 +832,19 @@ def _execute_python_fixed(code: str) -> Dict:
 # reload_api: hot-reload automation mixins + ext without restarting
 # ============================================================================
 
+# Dependency order: each module imports only from modules above it. The
+# utils package comes after its submodules -- reloading it re-binds the names
+# it re-exports (automation.base does `from ..utils import com_get, ...`).
+# Any other solidworks_mcp.utils.* found in sys.modules is reloaded too,
+# right before the package, so a new utils module can't silently stay old
+# (2026-09-26: typelib was missing here, the fresh ext.py failed on
+# `from .utils.typelib import get_iid` and left the server half-reloaded).
 _RELOAD_ORDER = [
+    "solidworks_mcp.utils.units",
+    "solidworks_mcp.utils.sw_finder",
     "solidworks_mcp.utils.com_helpers",
+    "solidworks_mcp.utils.typelib",
+    "solidworks_mcp.utils",
     "solidworks_mcp.toolsets",
     "solidworks_mcp.ext",
     "solidworks_mcp.automation.base",
@@ -824,27 +854,96 @@ _RELOAD_ORDER = [
     "solidworks_mcp.automation.capture",
     "solidworks_mcp.automation",
 ]
+_UTILS_PKG = "solidworks_mcp.utils"
+
+
+def _short(name: str) -> str:
+    return name[len("solidworks_mcp."):] if name.startswith("solidworks_mcp.") else name
+
+
+def _reload_plan() -> list:
+    order = list(_RELOAD_ORDER)
+    extra = sorted(n for n in sys.modules
+                   if n.startswith(_UTILS_PKG + ".") and n not in order and sys.modules[n] is not None)
+    i = order.index(_UTILS_PKG)
+    order[i:i] = extra
+    return [n for n in order if sys.modules.get(n) is not None]
 
 
 def _reload_api() -> Dict:
     """Reload modules in dependency order, then swap the live automation
     instance onto the fresh class -- the COM connection (instance state)
     survives. server.py itself is not reloaded (tool schemas are fixed at
-    MCP startup anyway)."""
-    done = []
-    try:
-        for name in _RELOAD_ORDER:
-            mod = sys.modules.get(name)
-            if mod is not None:
-                importlib.reload(mod)
-                done.append(name.rsplit(".", 1)[-1])
-        sw_automation.__class__ = sys.modules["solidworks_mcp.automation"].SolidWorksAutomation
-        return {"success": True, "message": "reloaded: " + ", ".join(done),
-                "error_code": 0, "error_name": "swSuccess"}
-    except Exception as e:
+    MCP startup anyway), which is why it reaches library code only through
+    module attributes (typelib.get_signature, not a from-imported name).
+
+    All or nothing: every file is compiled first (a syntax error reloads
+    nothing), and if a module then fails to execute (e.g. an ImportError on
+    a name its dependency doesn't have yet), every module already reloaded
+    in this call is put back to its previous namespace -- the server stays
+    consistently on the old code instead of half on each."""
+    plan = _reload_plan()
+
+    bad = []
+    for name in plan:
+        path = getattr(sys.modules[name], "__file__", None)
+        if not path:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                compile(fh.read(), path, "exec")
+        except Exception as e:
+            bad.append(f"{_short(name)}: {type(e).__name__}: {e}")
+    if bad:
         return {"success": False,
-                "message": f"reload failed after {done}: {e}\n{traceback.format_exc(limit=-3)}",
+                "message": "reload NOT started, nothing changed -- the server keeps running the "
+                           "previous code. Fix and call reload_api again:\n  " + "\n  ".join(bad),
                 "error_code": 999, "error_name": "swUnknownError"}
+
+    # set_units state: units.py re-creates its converter at mm. Carried as the
+    # string -- the Unit enum of the old module is a foreign class to the new one.
+    unit = getattr(units.get_converter().default_unit, "value", "mm")
+    saved: Dict[str, dict] = {}
+    current = None
+    try:
+        for name in plan:
+            current = name
+            mod = sys.modules[name]
+            saved[name] = dict(mod.__dict__)
+            importlib.reload(mod)
+        sw_automation.__class__ = sys.modules["solidworks_mcp.automation"].SolidWorksAutomation
+    except Exception as e:
+        tb = traceback.format_exc(limit=-3)
+        restored, broken = [], []
+        for name in reversed(list(saved)):  # includes the module that failed
+            try:
+                ns = sys.modules[name].__dict__
+                ns.clear()
+                ns.update(saved[name])
+                restored.append(_short(name))
+            except Exception as re:
+                broken.append(f"{_short(name)} ({re})")
+        ok_before = [_short(n) for n in list(saved)[:-1]]
+        rest = [_short(n) for n in plan[len(saved):]]
+        state = ("rolled back, the server is consistently on the PREVIOUS code"
+                 if not broken else
+                 f"⚠ rollback failed for {', '.join(broken)} -- state is mixed, "
+                 f"restart the server (scripts/restart_mcp.ps1)")
+        return {"success": False,
+                "message": (f"reload FAILED in {_short(current)}: {type(e).__name__}: {e}\n"
+                            f"reloaded before it: {', '.join(ok_before) or '-'}; "
+                            f"not attempted: {', '.join(rest) or '-'}\n"
+                            f"{state} (restored {len(restored)} module(s)).\n{tb}"),
+                "error_code": 999, "error_name": "swUnknownError"}
+    finally:
+        units.get_converter().default_unit = unit
+
+    extra = [_short(n) for n in plan if n not in _RELOAD_ORDER]
+    return {"success": True,
+            "message": (f"reloaded {len(plan)} modules: {', '.join(_short(n) for n in plan)}"
+                        + (f" (not in _RELOAD_ORDER, reloaded before utils: {', '.join(extra)})"
+                           if extra else "")),
+            "error_code": 0, "error_name": "swSuccess"}
 
 
 # ============================================================================
@@ -865,7 +964,7 @@ def _list_features_fixed() -> Dict:
 
         # FirstFeature: property on some SW versions, zero-arg method on
         # others -- com_get() reads it correctly either way.
-        feat = com_get(doc, "FirstFeature")
+        feat = com_helpers.com_get(doc, "FirstFeature")
 
         while feat is not None:
             try:
@@ -875,15 +974,15 @@ def _list_features_fixed() -> Dict:
                     name = "<unknown>"
 
                 try:
-                    feat_type = com_get(feat, "GetTypeName2")
+                    feat_type = com_helpers.com_get(feat, "GetTypeName2")
                 except:
                     try:
-                        feat_type = com_get(feat, "GetTypeName")
+                        feat_type = com_helpers.com_get(feat, "GetTypeName")
                     except:
                         feat_type = "<unknown>"
 
                 try:
-                    suppressed = com_get(feat, "IsSuppressed")
+                    suppressed = com_helpers.com_get(feat, "IsSuppressed")
                 except:
                     suppressed = False
 
@@ -909,7 +1008,7 @@ def _list_features_fixed() -> Dict:
             # feature. com_get() tries the call and falls back to the
             # pre-call value when it fails, which handles both cases.
             try:
-                feat = com_get(feat, "GetNextFeature")
+                feat = com_helpers.com_get(feat, "GetNextFeature")
             except:
                 break
         
@@ -946,7 +1045,7 @@ def _lookup_api_signature_handler(interface: str, member: str) -> Dict:
             "data": {},
         }
     try:
-        sig = get_signature(interface, member)
+        sig = typelib.get_signature(interface, member)
         return {
             "success": True,
             "message": f"{interface}.{member}",
@@ -975,7 +1074,7 @@ def _lookup_api_constant_handler(name: str) -> Dict:
             "data": {},
         }
     try:
-        value = get_constant(name)
+        value = typelib.get_constant(name)
         return {
             "success": True,
             "message": f"{name} = {value}",
@@ -1086,8 +1185,7 @@ def _get_sketch_status_handler() -> Dict:
         except:
             pass
         
-        # Walk feature tree through typed wrappers (ext) -- the old
-        # property-style walk broke once the doc came back makepy-typed.
+        # Walk the feature tree through ext (late-bound, v() for zero-arg members).
         try:
             for f in ext.user_features(ext.T(doc, "IModelDoc2")):
                 feat_type = ext.v(f, "GetTypeName2")
@@ -1134,14 +1232,9 @@ async def main():
     """Main entry point for MCP server"""
     logger.info("Starting SolidWorks MCP Server v4.0.0 (Fixed)...")
     logger.info(f"Log file: {LOG_FILE}")
-    # Load the makepy typelib up front: once it is imported, win32com hands
-    # out typed wrappers for some objects. Loading it lazily (first
-    # lookup_api_signature call) flipped dispatch behaviour mid-session.
-    try:
-        from .utils import get_sw_module
-        get_sw_module()
-    except Exception as e:
-        logger.warning(f"Typelib preload failed (SolidWorks installed?): {e}")
+    # No typelib preload: the server is late-bound only (utils/com_helpers.py).
+    # utils/typelib.py reads the registered typelib directly on first use,
+    # without generating or importing any makepy module.
 
     async with stdio_server() as (read_stream, write_stream):
         # tools_changed advertises tools.listChanged, which is what lets

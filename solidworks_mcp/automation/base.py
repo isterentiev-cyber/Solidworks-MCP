@@ -11,13 +11,13 @@ import datetime
 import traceback
 from typing import Optional, Dict, Any, Tuple
 
-# COM imports
-import win32com.client
+# COM imports (late-bound only -- see utils/com_helpers.py)
 import pythoncom
 
 from ..constants import SwErrors, SwPlanes, SwDocumentTypes, SwViews
 from ..config import get_config
 from ..utils import UnitConverter, find_solidworks, find_template, com_get
+from ..utils.com_helpers import connect_app, setp
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +51,7 @@ class SolidWorksAutomation:
             return False
 
         try:
-            # com_get actually invokes the member on a makepy-typed app too
-            # (there RevisionNumber is a method, and a bare attribute read
-            # would "succeed" even with SolidWorks gone).
+            # a real Invoke round trip: fails once SolidWorks is gone
             _ = com_get(self._sw_app, "RevisionNumber")
             return True
         except:
@@ -107,43 +105,34 @@ class SolidWorksAutomation:
 
     def _try_connect_com(self) -> bool:
         """
-        Try multiple COM connection methods
+        Attach to SolidWorks through late-bound COM.
+
+        Only `dynamic.Dispatch("SldWorks.Application")`: win32com.client.Dispatch /
+        GetObject / GetActiveObject return makepy-typed wrappers as soon as a
+        gen_py module for SldWorks is loaded in the process, and typed wrappers
+        use different out-param and zero-arg conventions (open_document broke
+        exactly like that). SolidWorks is a single-instance COM server, so this
+        attaches to the running instance.
 
         Returns:
             True if connection successful
         """
-        methods = [
-            # Method 1: GetObject (running instance)
-            lambda: win32com.client.GetObject(Class="SldWorks.Application"),
-            # Method 2: Dispatch (creates or gets existing)
-            lambda: win32com.client.Dispatch("SldWorks.Application"),
-            # Method 3: Dynamic Dispatch
-            lambda: win32com.client.dynamic.Dispatch("SldWorks.Application"),
-            # Method 4: GetActiveObject
-            lambda: win32com.client.GetActiveObject("SldWorks.Application"),
-        ]
-
-        for i, method in enumerate(methods):
-            try:
-                logger.debug(f"Trying connection method {i+1}...")
-                pythoncom.CoInitialize()
-                self._sw_app = method()
-
-                if self._sw_app is not None:
-                    self._sw_app.Visible = True
-
-                    # Get version (property or method)
-                    version = com_get(self._sw_app, "RevisionNumber")
-
-                    logger.info(f"Connected via method {i+1}: {version}")
-                    self._connected = True
-                    return True
-
-            except Exception as e:
-                logger.debug(f"Method {i+1} failed: {e}")
-                continue
-
-        return False
+        try:
+            pythoncom.CoInitialize()
+            app = connect_app()
+            if app is None:
+                return False
+            setp(app, "Visible", True)
+            version = com_get(app, "RevisionNumber")
+            self._sw_app = app
+            self._connected = True
+            logger.info(f"Connected (late-bound): {version}")
+            return True
+        except Exception as e:
+            logger.debug(f"Connect failed: {e}")
+            self._sw_app = None
+            self._connected = False
+            return False
 
     def connect(self) -> Dict:
         """

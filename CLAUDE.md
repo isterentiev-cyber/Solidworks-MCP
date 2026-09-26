@@ -11,8 +11,9 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
 
 ## Правила правки
 
-- **Правки кода: `reload_api`** перечитывает `automation/*`, `ext.py` и
-  `toolsets.py` с диска без рестарта (COM-коннект сохраняется) и шлёт
+- **Правки кода: `reload_api`** перечитывает `utils/*`, `automation/*`, `ext.py` и
+  `toolsets.py` с диска без рестарта, всё или ничего (при ошибке откат;
+  COM-коннект сохраняется) и шлёт
   клиенту `tools/list_changed`. Новое — писать в `ext.py` (он
   перезагружаемый). **Но Claude Desktop это уведомление игнорирует**:
   список тулов фиксируется на старте разговора, поэтому новый тул виден
@@ -22,34 +23,37 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
   `scripts/restart_mcp.ps1` (`-List` — показать процессы, `-Id <PID>` —
   убить один; серверов запущено по одному на сессию, обычно несколько).
   Детали — [NOTES.md § Перезагрузка сервера](NOTES.md#перезагрузка-сервера-новые-тулы-без-рестарта-клиента).
-- **Типизированные обёртки вместо угадывания**: в новом коде любой COM-объект
-  — через `T(obj, "IFace2")`, член — через `v(obj, "Name")` (ext.py). У
-  makepy-обёртки метод/свойство определены типобиблиотекой, никакой
-  неоднозначности. Ловушки обёртки (пустой callout, `InsertRefPlane`
-  возвращает не фичу, `CreatePoint` портит массив) — [NOTES.md § Типизированные обёртки](NOTES.md#типизированные-обёртки-makepy--ловушки).
+- **Только late binding** (с 2026-09-26): `win32com.client.dynamic`, нигде
+  (ни в сервере, ни в `execute_python`) `gencache` / `EnsureDispatch` /
+  makepy / `win32com.client.Dispatch` / `GetObject` / `GetActiveObject` —
+  с загруженным makepy-модулем они отдают typed-обёртки с другими правилами,
+  и тул работает то в одной сессии, то в другой. Правила вызова
+  (`utils/com_helpers.py`): zero-arg член — `v(obj, "GetTitle")`, не
+  `obj.GetTitle()`; out-параметр — `com.out_int()` & co или
+  `call_out(obj, "M", ..., OUT)`; пустой объект — `nothing()`, не `None`;
+  интерфейс — `T(obj, "IFace2")` (QueryInterface). `scripts/selftest.py`
+  ловит запрещённый API. Детали — [NOTES.md § Late binding](NOTES.md#late-binding-единое-соглашение-вызовов-с-2026-09-26),
+  ловушки API — [§ Ловушки API](NOTES.md#ловушки-api-не-зависят-от-обёртки).
 - **Ищи по API, а не угадывай имя.** `python scripts/swapi.py find shell`
   — греп по плоскому индексу всего API (9.8k методов, 3.4k свойств, 8.3k
   констант, ~900 КБ в `api-index/`). Отвечает на вопрос «а каким методом
   это вообще делается», на который `lookup_api_signature` не отвечает —
   тот требует, чтобы имя интерфейса и члена ты уже знал. **SolidWorks
-  запускать не нужно**, достаточно установленного: индекс строится из
-  makepy-кэша. Там же `swapi.py sig <Interface> <Member>` и
-  `swapi.py const <имя>` — то же, что MCP-тулы, но из любой сессии без
-  поднятого сервера. Индекс и кэш генерируются и в git не лежат;
-  пересобрать — `swapi.py build`. Детали —
+  запускать не нужно**, достаточно установленного: индекс строится прямо
+  из зарегистрированной typelib (без makepy). Там же `swapi.py sig
+  <Interface> <Member>` и `swapi.py const <имя>` — то же, что MCP-тулы, но
+  из любой сессии без поднятого сервера. Индекс генерируется и в git не
+  лежит; пересобрать — `swapi.py build`. Детали —
   [NOTES.md § Индекс API](NOTES.md#индекс-api-scriptsswapipy).
 - **Не угадывай параметры COM-методов.** Вызови тул `lookup_api_signature`
   (interface, member) — вернёт реальную сигнатуру из типобиблиотеки SW, а не
   из памяти/доки (которая для многих методов просто не совпадает с тем, что
   ждёт эта инсталляция — так нашлись баги в `FeatureRevolve2` и
   `InsertFeatureChamfer`, оба теперь исправлены). Для enum-констант
-  (`swEndCondBlind` и т.п.) — тул `lookup_api_constant`. Первый вызов после
-  рестарта SW генерирует кэш (~1-2 сек), дальше инстант. Детали механизма —
+  (`swEndCondBlind` и т.п.) — тул `lookup_api_constant`. Ответ показывает
+  флаги in/out и готовую late-bound строку вызова (какой `com.out_*()`
+  куда). Первое обращение за процесс ~1,4 с, дальше из памяти. Детали —
   [NOTES.md § Не угадывай сигнатуры](NOTES.md#не-угадывай-сигнатуры--используй-lookup_api_signature--lookup_api_constant).
-- **Property vs method неоднозначны** в *динамической* обёртке (старый код)
-  — `if callable(x): x = x()` не работает (ломает обход дерева фич). Там
-  `com_get(obj, name)` из `utils/com_helpers.py`; в новом коде — `T()`/`v()`.
-  Детали и почему — [NOTES.md § win32com dynamic dispatch](NOTES.md#win32com-dynamic-dispatch-property-vs-method--неоднозначность).
 
 ## Возможности, которые уже есть — не изобретай заново
 
@@ -62,6 +66,12 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
   (компактные таблицы; `p` у грани — точка НА грани), `find_face`/`find_edge`,
   `select_entities`. Индексы — в `fillet_edges`/`chamfer_edges(edge_indices)`,
   `create_sketch_on_face(face_index)`. Индексы меняются после каждой фичи.
+- **Сборки**: `get_assembly_tree` — дерево или flat-BOM с разделением
+  активных и подавленных экземпляров и честным «missing / stale path».
+  `get_component_properties` — свойства (значение + вычисленное), материал
+  SW против свойства `材料`/`Material`, масса по уникальным файлам в JSONL,
+  с бюджетом и cursor. Рецепт с `execute_python` больше не писать. Детали —
+  [NOTES.md § Сборки](NOTES.md#сборки-iassemblydoc-вставка-компонентов-и-мейты-через-api).
 - **Рамка эскиза**: `create_sketch*` пишет, куда смотрят оси эскиза в модели.
   В этом шаблоне Front — нормаль X, Top — Z, Right — Y; на Top ось X эскиза
   идёт вдоль мировой Y. Не угадывать — читать рамку.
@@ -140,19 +150,25 @@ SolidWorks через COM (win32com). Репозиторий отдельный 
 - `solidworks_mcp/automation/` — миксины по темам (`documents.py`,
   `features.py`, `sketches.py`, `capture.py`, `base.py` с общими хелперами
   и коннектом).
-- `solidworks_mcp/utils/` — `com_helpers.py` (property/method), `typelib.py`
-  (реальные сигнатуры/константы через makepy), `units.py`, `sw_finder.py`
-  (автопоиск инсталляции SW через реестр).
+- `solidworks_mcp/utils/` — `com_helpers.py` (late-bound вызовы: `v`,
+  `call_out`/`OUT`, `out_*`, `nothing`, `double_array`, `connect_app`),
+  `typelib.py` (сигнатуры/константы/IID прямо из ITypeLib, без makepy),
+  `units.py`, `sw_finder.py` (автопоиск инсталляции SW через реестр).
 - `solidworks_mcp/toolsets.py` — фильтр списка тулов по разделам через
   `SW_MCP_TOOLSETS` (`core` всегда включён; пусто = все). Схемы уходят
   в контекст модели при каждом запросе, а в типовой сессии живут 10-13
   тулов. Требует рестарта MCP, `reload_api` его не подхватит.
 - `scripts/swapi.py` — офлайн-поиск по API (см. выше), CAD не нужен.
+- `scripts/selftest.py` — годен ли код к запуску (без COM), включая запрет
+  gencache/typed API. `scripts/live_smoke.py --out DIR [--part P] [--asm A]
+  [--preload-typed]` — живой прогон тулов через `server.call_tool` на
+  запущенном SW (закрывает только то, что сам открыл).
 - `solidworks_mcp/ext.py` — всё добавленное поверх апстрима: хелперы
   (`T`, `v`, `snapshot`/`delta`, `face_rows`/`edge_rows`, `select_face_at`,
   `NoInference`, `xform`), реализации новых тулов и их схемы (`TOOL_SCHEMAS`).
 - `execute_python` (MCP-тул) — сырой доступ в том же процессе: `sw`, `doc`,
-  `md` (typed IModelDoc2), `T`, `v`, `ext`. Переменные живут между вызовами,
+  `md` (doc как IModelDoc2), `T`, `v`, `call_out`, `OUT`, `nothing`, `com`,
+  `ext`. Переменные живут между вызовами,
   вывод и traceback возвращаются вместе. Для разведки перед правкой тула.
 - `backup_20260209_*/` — снапшоты старых версий файлов, не апстрим и не
   рабочий код — не редактировать, не смотреть как источник истины.

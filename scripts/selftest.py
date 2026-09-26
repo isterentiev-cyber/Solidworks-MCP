@@ -50,6 +50,40 @@ def _check_view_sketch_math(ext):
     return bad
 
 
+_FORBIDDEN = ("gencache", "EnsureDispatch", "EnsureModule", "makepy",
+              "win32com.client.Dispatch", "win32com.client.GetObject",
+              "win32com.client.GetActiveObject", "CastTo")
+
+
+def _check_late_bound_only():
+    """The server is late-bound only (utils/com_helpers.py). Two guards:
+    no forbidden API in code (comments/strings ignored), and no makepy module
+    for a SolidWorks typelib imported by loading the server."""
+    import io
+    import tokenize
+    bad = []
+    for f in sorted((REPO / "solidworks_mcp").rglob("*.py")):
+        if "backup_" in str(f):
+            continue
+        toks = list(tokenize.generate_tokens(io.StringIO(f.read_text(encoding="utf-8")).readline))
+        code = [t for t in toks if t.type == tokenize.NAME or (t.type == tokenize.OP and t.string == ".")]
+        for i, t in enumerate(code):
+            if t.type != tokenize.NAME:
+                continue
+            dotted = t.string
+            j = i
+            while j + 2 < len(code) and code[j + 1].string == "." and code[j + 2].type == tokenize.NAME:
+                dotted += "." + code[j + 2].string
+                j += 2
+            for word in _FORBIDDEN:
+                if dotted == word or dotted.endswith("." + word) or dotted.startswith(word + "."):
+                    bad.append(f"{f.relative_to(REPO)}:{t.start[0]}: forbidden '{word}' (late-bound only)")
+    typed = [m for m in sys.modules if m.startswith("win32com.gen_py.")]
+    if typed:
+        bad.append(f"makepy modules imported by the server: {typed}")
+    return sorted(set(bad))
+
+
 def main():
     problems = []
     notes = []
@@ -104,6 +138,7 @@ def main():
                 problems.append(f"{t.name}: required '{req}' is not among its properties")
 
     problems += _check_view_sketch_math(ext)
+    problems += _check_late_bound_only()
 
     print(f"tools served: {len(tools)}")
     print(f"  ext handlers: {len(ext.HANDLERS)}   ext schemas: {len(ext.TOOL_SCHEMAS)}")

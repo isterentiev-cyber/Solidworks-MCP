@@ -5,20 +5,38 @@
 как нашлось и чем доказано — в `git log` (сжато 2026-09-23, прежняя
 версия — коммит до этой даты).
 
-## win32com dynamic dispatch: property vs method — неоднозначность
+## Late binding: единое соглашение вызовов (с 2026-09-26)
 
-Часть zero-arg членов (`GetTypeName2`, `GetTitle`, `FirstFeature`,
-`GetNextFeature`, `IsSuppressed`, `GetType`…) в динамической обёртке то
-свойство, то метод. `if callable(x): x = x()` **не работает**: `CDispatch`
-всегда callable, вызов готового объекта кидает `Member not found`, и обход
-дерева рвётся после первого элемента.
+Только `win32com.client.dynamic`. **Нигде** (сервер, `execute_python`) не
+использовать `gencache`, `EnsureDispatch`, makepy, `win32com.client.Dispatch`,
+`GetObject`, `GetActiveObject`: как только makepy-модуль SldWorks импортирован
+в процесс, они отдают typed-обёртки с другими правилами (out-параметры —
+кортежем, zero-arg методы — через `()`). Так `open_document` падал в одной
+сессии (`int() argument must be ... not 'VARIANT'`) и работал в следующей:
+тип обёртки зависел от того, загрузился ли модуль. `scripts/selftest.py`
+теперь валит сборку при запрещённом API в коде или gen_py-модуле в процессе.
 
-- Старый код: `com_get(obj, name)` (`utils/com_helpers.py`) — читает, при
-  callable пробует вызвать, при ошибке возвращает прочитанное.
-- Новый код: `T(obj, "IFace2")` + `v(obj, "Name")` — см. § Типизированные
-  обёртки.
-- Методы с аргументами и коллекции (`body.GetFaces()`, `GetEdges()`) —
-  обычный явный вызов.
+`IDispatch::GetTypeInfo` у SolidWorks отвечает `Element not found`, поэтому
+dynamic-обёртка всегда идёт через чистый `Invoke` и не знает, свойство член
+или метод. Правила (`utils/com_helpers.py`):
+
+- **zero-arg член (свойство или метод)** — `v(obj, "GetTitle")`. Обращение к
+  атрибуту уже вызывает его; `obj.GetTitle()` потом вызывает строку/None
+  (TypeError) или повторно дергает метод. `v()` идёт прямо в `Invoke`
+  (METHOD|PROPERTYGET), без угадывания и кэша win32com.
+- **член с аргументами** — `obj.M(a, b)` или `v(obj, "M", a, b)`.
+- **[out]-параметр** — `com.out_int()` / `out_bool()` / `out_str()` /
+  `out_float()` / `out_dispatch()`, после вызова читать `.value`; или
+  `call_out(obj, "OpenDoc6", path, 2, 1, "", OUT, OUT) -> (doc, err, warn)`.
+- **пустой объект** (Callout, ExportData, SelectData) — `nothing()`
+  (`VARIANT(VT_DISPATCH, None)`); голый `None` уходит как VT_EMPTY/VT_NULL →
+  `Type mismatch`. Для параметров типа `VARIANT` (ConfigNames и т.п.) `None`
+  допустим.
+- **массив double** в свойство/параметр — `com.double_array([...])`.
+- `T(obj, "IFace2")` = QueryInterface к IID из typelib + dynamic-обёртка.
+- Сигнатура с флагами in/out и готовой строкой вызова — `lookup_api_signature`
+  (или `swapi.py sig`), там же подсказка, какой `com.out_*()` нужен.
+- Старое имя `com_get(obj, name)` — то же, что `v(obj, name)`.
 
 ## Скрин детали + визуальная проверка геометрии
 
@@ -72,8 +90,22 @@ for f in body.GetFaces():                          # метод, со скобк
 
 ## Перезагрузка сервера: новые тулы без рестарта клиента
 
-- `reload_api` перезагружает `automation/*`, `ext.py`, `toolsets.py`
-  (COM-коннект сохраняется) и шлёт `tools/list_changed`.
+- `reload_api` перезагружает `utils/*` (все подмодули, потом пакет —
+  чтобы обновились реэкспорты), `toolsets.py`, `ext.py`, `automation/*`
+  (COM-коннект сохраняется) и шлёт `tools/list_changed`. Порядок —
+  `_RELOAD_ORDER` в `server.py`; новый `utils/*.py` подхватывается и без
+  записи туда. **Всё или ничего** (с 2026-09-26): сначала компилируются все
+  файлы (синтаксическая ошибка → не перезагружается ничего), а если модуль
+  падает при исполнении (ImportError и т.п.), уже перезагруженные
+  откатываются к прежним namespace. В ответе — где упало, что успело,
+  что не пробовалось. До этого `typelib` в списке не было, новый `ext.py`
+  падал на `get_iid` и сервер оставался наполовину на новом коде.
+- `server.py` берёт библиотечный код только через атрибут модуля
+  (`typelib.get_signature`, `com_helpers.com_get`), не `from … import имя`:
+  сам он не перезагружается, и импортированное по имени навсегда остаётся
+  старым. Так `lookup_api_signature` после reload звал старый makepy-шный
+  `get_signature` (`inspect.getsource` → «could not get source code»), а
+  `execute_python` — уже новый.
 - **Claude Desktop это уведомление игнорирует**: список тулов фиксируется на
   старте разговора. Новый тул виден только в НОВОМ чате, рестарт сервера не
   помогает. В текущем чате — `execute_python` → `ext.t_имя(sw, {...})`.
@@ -84,6 +116,13 @@ for f in body.GetFaces():                          # метод, со скобк
   SLDWORKS.exe → межпроцессные гонки возможны. После убийства процесса
   клиент поднимает сервер лениво, на первом вызове;
   `session_connectors_status` показывает кэш, а не живое состояние.
+- Сервер `solidworks` объявлять только в одном месте — глобально, в
+  `%APPDATA%\Claude\claude_desktop_config.json`. До 2026-09-26 он был
+  продублирован в `D:\Claude\Demo\.mcp.json`, и вызовы одной сессии уходили в
+  разные процессы: `reload_api`/`execute_python` в перезапущенный, а
+  `get_assembly_tree` — в старый, со старым кодом. Проектная запись удалена.
+  Если тул после правки ведёт себя по-старому, сравни `os.getpid()` из
+  `execute_python` с `restart_mcp.ps1 -List`.
 
 ## Проба занятости: отказ вместо зависания
 
@@ -112,15 +151,11 @@ python scripts/swapi.py build | stats
 ```
 
 Отвечает на «каким методом это делается» (у `lookup_api_signature` имя уже
-надо знать). ~9,8k методов, 3,4k свойств, 8,3k констант, ~900 КБ в
-`api-index/`. SW запускать не нужно — строится из makepy-кэша.
-Ранжирование: совпадение в имени члена выше, чем в параметрах.
-
-Кэш makepy — `<repo>/.gen_py` (переопределить: `SW_MCP_GEN_PY`), логика в
-`utils/typelib.py::_relocate_gen_cache`. Две ловушки: `dicts.dat`
-перечитывается явно (загружен при импорте по старому пути);
-`gencache.Rebuild(verbose=0)` — иначе прогресс уходит в stdout = протокол
-MCP.
+надо знать). ~9,5k методов (out-параметры помечены `[out]`), 3,6k свойств,
+8,3k констант, ~930 КБ в `api-index/`. SW запускать не нужно — строится
+напрямую из зарегистрированной typelib (`utils/typelib.py`, ITypeLib), без
+makepy и gen_py. Ранжирование: совпадение в имени члена выше, чем в
+параметрах.
 
 ## Фильтр тулов по разделам (SW_MCP_TOOLSETS)
 
@@ -135,10 +170,13 @@ MCP.
 Память и документация расходятся с этой инсталляцией. Так нашлись
 `FeatureRevolve2` — **20** параметров (не 18: `OffsetDistance1/2` между
 `OffsetReverse2` и `ThinType`) и `InsertFeatureChamfer` — **8** (не 7).
-Реализация — `utils/typelib.py`. Типобиблиотеки — `sldworks.tlb` +
-`swconst.tlb` в каталоге SW. `makepy.GenerateFromTypeLibSpec` принимает
-объект из `selecttlb.EnumTlbs()`, голый кортеж → `Library not registered`.
-Кэш не коммитить (машинно-зависимый).
+Реализация — `utils/typelib.py`: `selecttlb.EnumTlbs()` (только чтение
+реестра, версии там hex-строками: `"22"` = 34 = SW 2026) →
+`pythoncom.LoadRegTypeLib` → ITypeInfo/FUNCDESC/VARDESC. Ничего не
+генерирует на диск. Первое обращение ~1,4 с, дальше из памяти. Там же
+`get_iid` (для `T()`), `out_params`, `enum_values` / `enum_flags` (расшифровка
+битовых кодов вроде `swFileLoadError_e`). Лок — `RLock`: `constants()`
+держит его и вызывает `_load()`, с обычным `Lock` это дедлок.
 
 ## Построение вала/тела вращения
 
@@ -185,8 +223,74 @@ False,False,False,False,False, True,True,True,True, False, 0,0, False)`
 
 ## Сборки (IAssemblyDoc): вставка компонентов и мейты через API
 
-Рабочий рецепт: `ladder-panel.SLDASM` (проект Demo, 2026-09-12). Тулов для
-сборок нет, только `execute_python`.
+Чтение сборки — тулы (2026-09-26):
+
+- `open_document` на `.sldasm`: silent, раскодированные `swFileLoadError_e` /
+  `swFileLoadWarning_e`, число компонентов, сколько пришло lightweight, и
+  `ResolveAllLightWeightComponents` (по умолчанию). В Large Assembly Mode
+  (порог — системная настройка SW) всё грузится lightweight, и
+  `GetModelDoc2` у компонентов отдаёт None — массы/фичи не читаются.
+  844 компонента: открытие ~20 с + разрешение ~8–9 с.
+- `get_assembly_tree`: один `GetComponents(False)`, иерархия из путей `Name2`
+  (`parent-1/child-1`). Рекурсивный `GetChildren` на 844 компонентах не
+  укладывался в таймаут MCP. Каждое чтение члена компонента — межпроцессный
+  `Invoke` **~4 мс** (SW при этом грузит одно ядро на 100%), плюс
+  `GetComponents` 7–8 с и освобождение 844 прокси ~3–4 с. Поэтому сначала
+  читается только `Name2`, остальное — в пределах `max_depth`, под
+  `time_budget_s` (40 с по умолчанию, дальше честное «прочитано N из M»).
+  `details` добавляет 5 членов на компонент (+~17 с на 844).
+  Подавленный компонент не загружен, и `GetPathName` отдаёт путь с машины
+  автора (`C:\Users\Administrator\…`), поэтому одного `os.path.exists`
+  мало. `_RefResolver` ищет файл там же, где SW: в папке ссылающегося
+  документа и в папке сборки, в том числе по хвосту сохранённого пути.
+  Статусы: `ok` / `relocated` / `missing`. В flat-режиме количество
+  разделено: `×активные (+N suppressed)`, а подавленными считаются и
+  экземпляры внутри подавленной подсборки.
+- `get_component_properties` (2026-09-26): свойства, материал и масса по
+  **уникальным файлам**, построчно в JSONL, с бюджетом времени и cursor.
+  - Файлы группируются по фактическому пути после `_RefResolver`. Если
+    группировать по сохранённому, один и тот же файл даёт две строки
+    (982S-02: активный экземпляр по реальному пути, подавленный — по
+    авторскому).
+  - Документ берётся только через `Component2.GetModelDoc2` у загруженного
+    активного экземпляра. Подавленные и lightweight файлы не резолвятся:
+    для них строка `status="not_loaded"` с причиной и `path_status`.
+  - **`GetAll3` отдаёт в `PropValues` уже вычисленные значения**, а
+    четвёртый массив (`Resolved`) — это не строки, а
+    `swCustomInfoGetResult_e` (0 cached, 1 not present, 2 resolved). Исходное
+    выражение (`$PRP:"SW-File Name"`, `"SW-Mass@x.SLDPRT"`) отдаёт только
+    старый `GetAll` (имена/типы/значения, тот же порядок). Поэтому на
+    каждый набор свойств два вызова: `GetAll3` + `GetAll`, а не `Get6` на
+    каждое свойство. `PropLink` у выражений тоже 0. Проверено на временной
+    детали и на реальных `液晶保护镜片`, `轴流风机DFB40`.
+  - `CustomPropertyManager` — индексируемое свойство:
+    `Invoke(dispid, …, "")` / `(…, cfg)`. `""` — уровень файла.
+    `config="active"` читает конфигурации, на которые ссылаются активные
+    экземпляры.
+  - Материал: `IPartDoc.GetMaterialPropertyName2(cfg, out db)`, в `db`
+    лежит `"SolidWorks 材质"`. Флаг `material_mismatch` ставится при
+    буквальном расхождении после нормализации пробелов и регистра, поэтому
+    «6061 合金» ≠ «6061-T6» и «普通碳钢» ≠ «A3» тоже попадают в mismatch.
+    Смысловую эквивалентность тул не оценивает.
+  - Скорость: один межпроцессный вызов на этой сборке стоит ~10 мс,
+    `T()`/`v()` на каждый объект давали ~190 мс на файл. С голым
+    `IDispatch` и dispid, закэшированными по роли (`_Raw`), выходит
+    ~50–90 мс. 8320A-ZZ-01 (123 файла): 8,8 с без массы, 13,9 с с массой,
+    из них 3–4 с уходит на список компонентов. Список кэшируется между
+    вызовами по fingerprint cursor, после `reload_api` собирается заново.
+  - Продолжение: cursor = `next/total/fingerprint`, где fingerprint — хэш
+    сборки, аргументов и списка файлов. Строки, пути которых уже есть в
+    JSONL, пропускаются, поэтому повтор старого cursor дублей не даёт.
+    Cursor с другими аргументами отклоняется, после строки `summary` файл
+    не дописывается. На вызов обрабатывается минимум один файл, даже если
+    бюджет уже съеден списком компонентов.
+- Проверка интерференций (`InterferenceDetectionManager`) — тула нет.
+  Повторный вызов менеджера без `Done()` уронил SW 2026 SP3 (стек в
+  `uiInterferAsmDveDlg_c::collectComponentsToIsolate`); 844 компонента —
+  ~46–49 с на один расчёт.
+
+Вставка компонентов и мейты. Рабочий рецепт: `ladder-panel.SLDASM` (проект
+Demo, 2026-09-12), только `execute_python`.
 
 - **`AddComponent5(path, 0, "", False, "", X, Y, Z)`**: X,Y,Z — **центр
   bbox** детали, а не её начало. Проверка — `component.Transform2.ArrayData`
@@ -194,8 +298,8 @@ False,False,False,False,False, True,True,True,True, False, 0,0, False)`
 - Фиксация: выбрать `COMPONENT` → `doc.FixComponent()`.
 - Имя для `SelectByID2`: `"Фича@Компонент-1@Сборка"` — третий сегмент
   обязателен, без него тихо False. Сам компонент — `"Компонент-1@Сборка"`.
-- **`AddMate5`**: 14 входных + out `ErrorStatus` =
-  `VARIANT(VT_BYREF|VT_I4, 0)`. Обе стороны выбирать с `Mark=1`.
+- **`AddMate5`**: 14 входных + out `ErrorStatus` = `com.out_int()`
+  (или `call_out(asm, "AddMate5", ..., OUT)`). Обе стороны выбирать с `Mark=1`.
   `swMateCOINCIDENT=0`, `CONCENTRIC=1`, `DISTANCE=5`.
 - Вторая копия детали параллельно первой без остаточных DOF:
   2× Coincident по одноимённым плоскостям поперёк сдвига + Distance по
@@ -204,31 +308,23 @@ False,False,False,False,False, True,True,True,True, False, 0,0, False)`
   совпадают элементы разных компонентов: берётся не та грань, `AddMate5` →
   None. Черновые компоненты ставить в заведомо пустое место.
 
-## Типизированные обёртки (makepy) — ловушки
+## Ловушки API (не зависят от обёртки)
 
-Объекты приходят то типизированными, то динамическими (`ActiveDoc` —
-динамический), поэтому новый код оборачивает всё сам: `ext.T(obj, "IFace2")`,
-члены — `ext.v(obj, "Name")`.
-
-- `T()` надёжен только для «своего» интерфейса: `T(sketch, "IFeature")`
-  проходит QI, но диспетчит по ISketch. Фичу эскиза искать через
-  `ext.sketch_feature`.
-- `ISldWorks.RevisionNumber`, `IFeature.GetTypeName2`, `IsSuppressed`,
-  `IEquationMgr.Equation/Value/GlobalVariable` — в typed-обёртке методы.
-- `SelectByID2` Callout: typed хочет `None`, динамический —
-  `VARIANT(VT_DISPATCH)`. `ext.select_by_id` пробует оба.
+- Фичу эскиза искать через `ext.sketch_feature`: `T(sketch, "IFeature")`
+  с typed-обёрткой диспетчил по ISketch; на late-bound не перепроверено.
+- `SelectByID2` Callout — `nothing()` (`ext.select_by_id`).
 - **`SelectByID2("", "FACE", x,y,z)` → False** даже на плоской грани;
   `ext.select_face_at` (`GetClosestPointOn` + `SelectByRay`).
 - `InsertRefPlane` возвращает `IRefPlane`, не `IFeature` (новая фича —
   последняя в дереве). Double-параметры передавать float.
-- `IMathUtility.CreatePoint` через typed даёт мусор (1e-311). Считать самому
+- `IMathUtility.CreatePoint` с Python-списком давал мусор (1e-311). Считать самому
   по `IMathTransform.ArrayData`: `p' = (p·R)·scale + t`, R = a[0:9],
   t = a[9:12], scale = a[12] (`ext.xform`).
 - **Массив в свойство** (`IView.Position` и т.п.) — только
-  `VARIANT(VT_ARRAY|VT_R8, [...])`; кортеж молча пишет мусор.
+  `com.double_array([...])` (`VT_ARRAY|VT_R8`); кортеж молча пишет мусор.
 - Середина LINE-ребра — среднее концов (`Evaluate2` по середине
   параметра уезжает за ребро), остальных — `GetClosestPointOn`.
-- `GetFirstDisplayDimension` у фичи без размеров → int 0 (makepy падает):
+- `GetFirstDisplayDimension` у фичи без размеров → int 0, а не Nothing:
   `ext.display_dims()`.
 
 ## Мелкие исправления тулов (2026-09-19)

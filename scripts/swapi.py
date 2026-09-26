@@ -12,9 +12,9 @@ starting condition. The real question is usually the other way round:
 This builds a flat, greppable index of the whole typelib and searches it.
 
 SolidWorks does NOT have to be running -- only installed. Everything here
-reads the makepy cache (see solidworks_mcp/utils/typelib.py), which is
-generated from SolidWorks' own type library, i.e. ground truth for THIS
-install rather than documentation or memory.
+reads SolidWorks' own registered type library directly through ITypeLib
+(solidworks_mcp/utils/typelib.py -- no makepy, no gen_py cache), i.e. ground
+truth for THIS install rather than documentation or memory.
 
 Usage:
     python scripts/swapi.py find shell            # search everything
@@ -28,7 +28,6 @@ Index files land in api-index/ (generated, gitignored).
 """
 
 import argparse
-import inspect
 import re
 import sys
 from pathlib import Path
@@ -53,83 +52,40 @@ KIND_FILES = {
 # Build
 # ---------------------------------------------------------------------------
 
-def _iter_interfaces(mod):
-    """Yield (name, class) for generated COM interface wrappers only.
-
-    The module also holds CoClasses and helper types; those carry neither a
-    property map nor generated methods, so they get skipped.
-    """
-    for name in dir(mod):
-        if name.startswith("_"):
-            continue
-        obj = getattr(mod, name, None)
-        if not inspect.isclass(obj):
-            continue
-        own = vars(obj)
-        has_props = "_prop_map_get_" in own or "_prop_map_put_" in own
-        has_methods = any(callable(v) and not k.startswith("_")
-                          for k, v in own.items())
-        if has_props or has_methods:
-            yield name, obj
-
-
-def _params(fn):
-    """Parameter names of a generated method, without self."""
-    try:
-        sig = inspect.signature(fn)
-    except (ValueError, TypeError):
-        return None
-    return [p for p in sig.parameters if p != "self"]
-
-
 def build(verbose=True):
-    """Regenerate the index files from the makepy cache."""
-    from solidworks_mcp.utils.typelib import get_sw_module, get_const_module
+    """Regenerate the index files from the registered typelibs."""
+    from solidworks_mcp.utils import typelib
 
     INDEX_DIR.mkdir(exist_ok=True)
-
-    mod = get_sw_module()
     method_lines, prop_lines = [], []
 
-    for iface, cls in _iter_interfaces(mod):
-        own = vars(cls)
-        for member, val in own.items():
-            if member.startswith("_") or not callable(val):
-                continue
-            # CoClass shim, present on every coclass and never callable API
-            if member == "default_interface":
-                continue
-            names = _params(val)
-            args = ", ".join(names) if names is not None else "?"
-            method_lines.append("%s.%s(%s)" % (iface, member, args))
-
-        getters = set(own.get("_prop_map_get_", {}))
-        setters = set(own.get("_prop_map_put_", {}))
-        for member in sorted(getters | setters):
-            if member in getters and member in setters:
-                mode = "get/put"
-            elif member in getters:
-                mode = "get"
+    for iface in typelib.interfaces():
+        try:
+            members = typelib.members(iface)
+        except Exception:
+            continue  # enums, coclasses, aliases
+        props = {}
+        for m in members:
+            if m["kind"] == "method":
+                args = ", ".join(("[out] " if p[2] & 0x2 else "") + p[0] for p in m["params"])
+                method_lines.append("%s.%s(%s)" % (iface, m["name"], args))
             else:
-                mode = "put"
-            prop_lines.append("%s.%s  [%s]" % (iface, member, mode))
+                props.setdefault(m["name"], set()).add("get" if m["kind"] == "get" else "put")
+        for name, modes in props.items():
+            mode = "get/put" if len(modes) > 1 else next(iter(modes))
+            prop_lines.append("%s.%s  [%s]" % (iface, name, mode))
 
-    constants = get_const_module().constants
     const_lines = []
-    for name in dir(constants):
-        if name.startswith("_"):
-            continue
-        value = getattr(constants, name)
+    for name, value in typelib.constants().items():
         if isinstance(value, str):
             const_lines.append("%s = %r" % (name, value))
         elif isinstance(value, (int, float)):
             const_lines.append("%s = %s" % (name, value))
 
     written = []
-    for path, lines in ((METHODS, method_lines),
-                        (PROPS, prop_lines),
-                        (CONSTS, const_lines)):
-        lines.sort()
+    for path, lines in ((METHODS, sorted(set(method_lines))),
+                        (PROPS, sorted(set(prop_lines))),
+                        (CONSTS, sorted(set(const_lines)))):
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         written.append((path, len(lines)))
         if verbose:
@@ -238,7 +194,7 @@ def main(argv=None):
     f.add_argument("-n", "--limit", type=int, default=40, help="max hits per kind")
     f.add_argument("-e", "--regex", action="store_true", help="treat query as a regex")
 
-    s = sub.add_parser("sig", help="full generated source of one member")
+    s = sub.add_parser("sig", help="signature of one member (in/out flags, late-bound call hint)")
     s.add_argument("interface")
     s.add_argument("member")
 

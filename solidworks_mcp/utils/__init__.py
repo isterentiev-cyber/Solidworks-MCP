@@ -21,8 +21,9 @@ from .sw_finder import (
 )
 
 from .com_helpers import com_get, com_call
+from . import com_helpers as com
 
-from .typelib import get_signature, get_constant, get_sw_module, get_const_module
+from .typelib import get_signature, get_constant, get_iid, out_params
 
 __all__ = [
     # Units
@@ -42,10 +43,11 @@ __all__ = [
     # COM access helpers
     "com_get",
     "com_call",
+    "com",
 
     # Typelib introspection (real method signatures / constants)
     "get_signature",
     "get_constant",
-    "get_sw_module",
-    "get_const_module",
+    "get_iid",
+    "out_params",
 ]

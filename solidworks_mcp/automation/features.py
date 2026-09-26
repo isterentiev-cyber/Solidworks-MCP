@@ -23,6 +23,7 @@ import win32com.client
 import pythoncom
 
 from ..constants import SwErrors, SwEndConditions
+from ..utils.com_helpers import v
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,7 @@ class FeatureOperations:
     # ========================================================================
 
     def _find_last_sketch(self, doc) -> Optional[str]:
-        """Name of the last sketch in the feature tree (typed walk via ext --
-        works whether `doc` came back dynamic or makepy-typed)."""
+        """Name of the last sketch in the feature tree (walk via ext)."""
         from .. import ext
         last = None
         try:
@@ -105,7 +105,7 @@ class FeatureOperations:
             # produced a zero-volume Boss-Extrude on top of the old one.
             from .. import ext
             feat = ext.find_feature(ext.T(doc, "IModelDoc2"), sketch_name)
-            children = feat.GetChildren() or ()
+            children = v(feat, "GetChildren") or ()
             if children:
                 used_by = [ext.T(c, "IFeature").Name for c in children]
                 return False, sketch_name, (
@@ -269,7 +269,7 @@ class FeatureOperations:
         selection.
 
         FeatureRevolve2's real signature is 20 positional params (confirmed
-        against the SolidWorks typelib via makepy -- see CLAUDE.md "makepy"
+        against the SolidWorks typelib (lookup_api_signature) -- see CLAUDE.md
         section). Earlier attempts at 18 and 21 params both failed
         (`Parameter not optional` / `Invalid number of parameters`); the
         two commonly-missed ones are OffsetDistance1/OffsetDistance2,
@@ -536,7 +536,7 @@ class FeatureOperations:
 
             try:
                 # InsertFeatureChamfer takes 8 params, confirmed against the
-                # real typelib (see CLAUDE.md "makepy" section) --
+                # real typelib (lookup_api_signature) --
                 # (Options, ChamferType, Width, Angle, OtherDist,
                 # VertexChamDist1, VertexChamDist2, VertexChamDist3).
                 # ChamferType=0 is angle-distance (Width + Angle); the trailing

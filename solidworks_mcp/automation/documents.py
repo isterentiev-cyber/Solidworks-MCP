@@ -9,11 +9,12 @@ import logging
 import traceback
 from typing import Optional, Dict
 
-import win32com.client
 import pythoncom
 
 from ..constants import SwErrors, SwDocumentTypes, SwFileTypes
 from ..utils import com_get
+from ..utils.com_helpers import v, nothing, call_out, OUT
+from ..utils.typelib import enum_flags
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ class DocumentOperations:
             # Set view
             try:
                 doc.ShowNamedView2("*Isometric", 7)
-                doc.ViewZoomtofit2()
+                v(doc, "ViewZoomtofit2")
             except:
                 pass
             
@@ -112,7 +113,7 @@ class DocumentOperations:
             
             try:
                 doc.ShowNamedView2("*Isometric", 7)
-                doc.ViewZoomtofit2()
+                v(doc, "ViewZoomtofit2")
             except:
                 pass
             
@@ -170,27 +171,32 @@ class DocumentOperations:
             logger.error(f"Create drawing error: {e}\n{traceback.format_exc()}")
             return self._result(False, f"Error: {e}", SwErrors.swFileLoadError)
     
-    def open_document(self, filepath: str) -> Dict:
+    def open_document(self, filepath: str, resolve_lightweight: bool = True,
+                      read_only: bool = False) -> Dict:
         """
-        Open an existing document
-        
+        Open an existing document (late-bound OpenDoc6, silent).
+
         Args:
             filepath: Path to SolidWorks file
-        
+            resolve_lightweight: for assemblies, resolve lightweight components
+                right after opening (Large Assembly Mode loads everything
+                lightweight and GetModelDoc2 then returns None for every part)
+            read_only: open read-only
+
         Returns:
-            Result dictionary
+            Result dictionary; data has errors/warnings (decoded) and, for an
+            assembly, component counts
         """
         try:
             if not self.is_connected:
                 r = self.connect()
                 if not r["success"]:
                     return r
-            
+
             if not os.path.exists(filepath):
                 return self._result(False, f"File not found: {filepath}",
                                   SwErrors.swFileNotFoundError)
-            
-            # Determine document type from extension
+
             ext = os.path.splitext(filepath)[1].lower()
             type_map = {
                 ".sldprt": SwDocumentTypes.swDocPART,
@@ -198,36 +204,77 @@ class DocumentOperations:
                 ".slddrw": SwDocumentTypes.swDocDRAWING,
             }
             doc_type = type_map.get(ext, SwDocumentTypes.swDocPART)
-            
-            # Open document
-            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            
-            doc = self._sw_app.OpenDoc6(filepath, int(doc_type), 0, "", errors, warnings)
-            
-            if doc is None or errors.value != 0:
-                return self._result(False, f"Failed to open (error {errors.value})",
-                                  SwErrors.swFileLoadError)
-            
+
+            # swOpenDocOptions_Silent (1) | swOpenDocOptions_ReadOnly (2)
+            options = 1 | (2 if read_only else 0)
+            doc, errors, warnings = call_out(self._sw_app, "OpenDoc6", filepath,
+                                             int(doc_type), options, "", OUT, OUT)
+            err_names = enum_flags("swFileLoadError_e", errors)
+            warn_names = enum_flags("swFileLoadWarning_e", warnings)
+
+            if doc is None:
+                return self._result(False,
+                    f"Failed to open (errors {errors}: {', '.join(err_names) or '?'}; "
+                    f"warnings {warnings}: {', '.join(warn_names) or '-'})",
+                    SwErrors.swFileLoadError,
+                    {"errors": errors, "error_names": err_names,
+                     "warnings": warnings, "warning_names": warn_names})
+
             title = self._get_doc_title(doc)
-            
-            return self._result(True, f"Opened: {title}",
-                              SwErrors.swSuccess,
-                              {"name": title, "path": filepath})
-            
+            data = {"name": title, "path": filepath,
+                    "errors": errors, "error_names": err_names,
+                    "warnings": warnings, "warning_names": warn_names}
+            msg = f"Opened: {title}"
+            if errors or warnings:
+                msg += f" | errors {errors} {err_names} warnings {warnings} {warn_names}"
+
+            if int(doc_type) == SwDocumentTypes.swDocASSEMBLY:
+                data.update(self._assembly_load_state(doc, resolve_lightweight))
+                msg += (f" | components {data['components']} "
+                        f"(top level {data['top_level']}), "
+                        f"lightweight {data['lightweight_before']}")
+                if data.get("resolved"):
+                    msg += f" -> resolved in {data['resolve_s']}s"
+                if data.get("large_assembly_mode"):
+                    msg += ", Large Assembly Mode"
+
+            return self._result(True, msg, SwErrors.swSuccess, data)
+
         except Exception as e:
             logger.error(f"Open document error: {e}\n{traceback.format_exc()}")
             return self._result(False, f"Error: {e}", SwErrors.swFileLoadError)
-    
+
+    def _assembly_load_state(self, doc, resolve: bool) -> Dict:
+        """Component counts and lightweight state of a freshly opened assembly;
+        optionally resolves lightweight components."""
+        import time
+        from .. import ext
+        asm = ext.T(doc, "IAssemblyDoc")
+        comps = v(asm, "GetComponents", False) or ()
+        top = v(asm, "GetComponents", True) or ()
+        # swComponentSuppressionState_e: 1 = lightweight, 4 = fully lightweight
+        light = sum(1 for c in comps if v(c, "GetSuppression2") in (1, 4))
+        info = {"components": len(comps), "top_level": len(top),
+                "lightweight_before": light, "resolved": False}
+        try:
+            info["large_assembly_mode"] = bool(v(ext.T(doc, "IModelDoc2"), "LargeAssemblyMode"))
+        except Exception:
+            pass
+        if resolve and light:
+            t0 = time.time()
+            v(asm, "ResolveAllLightWeightComponents", False)
+            info["resolved"] = True
+            info["resolve_s"] = round(time.time() - t0, 1)
+        return info
+
     def save_document(self, filepath: str = None) -> Dict:
         """
-        Save the active document
-        FIXED v4.1: Use doc.SaveAs() as primary method (avoids COM type mismatch
-        with Extension.SaveAs where None parameter fails in SW 2025).
-        
+        Save the active document.
+
         Args:
-            filepath: Path to save (None = save in place)
-        
+            filepath: Save As path (None = save in place). Save As switches the
+                open document to the new file, like SolidWorks' own Save As.
+
         Returns:
             Result dictionary
         """
@@ -235,84 +282,43 @@ class DocumentOperations:
             doc, err = self.get_active_doc()
             if err:
                 return err
-            
+
+            from .. import ext
+            md = ext.T(doc, "IModelDoc2")
+
             if filepath:
-                # Ensure absolute path
                 filepath = os.path.abspath(filepath)
-                
-                # Ensure directory exists
                 dir_path = os.path.dirname(filepath)
                 if dir_path and not os.path.exists(dir_path):
                     os.makedirs(dir_path)
-                
-                saved = False
-                method_used = ""
-                
-                # Method 1: doc.SaveAs (simplest, most reliable for SW 2025)
-                try:
-                    result = doc.SaveAs(filepath)
-                    if result:
-                        saved = True
-                        method_used = "SaveAs"
-                except Exception as e:
-                    logger.debug(f"doc.SaveAs failed: {e}")
-                
-                # Method 2: Extension.SaveAs with proper VARIANT null dispatch
-                if not saved:
-                    try:
-                        empty_export = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-                        errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                        warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                        
-                        result = doc.Extension.SaveAs(
-                            filepath, 0, 0, empty_export, errors, warnings
-                        )
-                        if result and errors.value == 0:
-                            saved = True
-                            method_used = "Extension.SaveAs"
-                    except Exception as e:
-                        logger.debug(f"Extension.SaveAs failed: {e}")
-                
-                # Method 3: Extension.SaveAs2
-                if not saved:
-                    try:
-                        errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                        warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                        
-                        result = doc.Extension.SaveAs2(
-                            filepath, 0, 0, None, "", False, errors, warnings
-                        )
-                        if result:
-                            saved = True
-                            method_used = "Extension.SaveAs2"
-                    except Exception as e:
-                        logger.debug(f"Extension.SaveAs2 failed: {e}")
-                
-                if not saved:
-                    return self._result(False, "Save failed - all methods attempted",
-                                      SwErrors.swFileSaveError)
-                
-                return self._result(True, f"Saved: {filepath} [{method_used}]",
-                                  SwErrors.swSuccess,
-                                  {"path": filepath, "method": method_used})
-            else:
-                # Save in place (Save3 returns True on success; Errors and
-                # Warnings are out params -- see ext.save_in_place)
-                from .. import ext
-                ok, errs, warns = ext.save_in_place(ext.T(doc, "IModelDoc2"))
 
-                if not ok:
-                    return self._result(False, f"Save failed (errors={errs}, warnings={warns})",
-                                      SwErrors.swFileSaveError)
-                
-                path = self._get_doc_path(doc)
-                return self._result(True, f"Saved: {path}",
-                                  SwErrors.swSuccess, {"path": path})
-            
+                # IModelDocExtension.SaveAs3(Name, Version, Options, ExportData,
+                # AdvancedSaveAsOptions, [out] Errors, [out] Warnings)
+                # swSaveAsCurrentVersion = 0, swSaveAsOptions_Silent = 1
+                ok, errs, warns = call_out(v(md, "Extension"), "SaveAs3", filepath, 0, 1,
+                                           nothing(), nothing(), OUT, OUT)
+                if not ok or errs:
+                    names = enum_flags("swFileSaveError_e", errs)
+                    return self._result(False,
+                        f"Save As failed (errors {errs}: {', '.join(names) or '?'}, "
+                        f"warnings {warns})", SwErrors.swFileSaveError,
+                        {"errors": errs, "error_names": names, "warnings": warns})
+                return self._result(True, f"Saved: {filepath}", SwErrors.swSuccess,
+                                    {"path": filepath, "warnings": warns})
+
+            ok, errs, warns = ext.save_in_place(md)
+            if not ok:
+                names = enum_flags("swFileSaveError_e", errs)
+                return self._result(False,
+                    f"Save failed (errors {errs}: {', '.join(names) or '?'}, warnings {warns})",
+                    SwErrors.swFileSaveError)
+            path = self._get_doc_path(doc)
+            return self._result(True, f"Saved: {path}", SwErrors.swSuccess, {"path": path})
+
         except Exception as e:
             logger.error(f"Save error: {e}\n{traceback.format_exc()}")
             return self._result(False, f"Error: {e}", SwErrors.swFileSaveError)
-    
+
     def close_document(self, save: bool = False) -> Dict:
         """
         Close the active document
@@ -332,9 +338,12 @@ class DocumentOperations:
             
             if save:
                 from .. import ext
-                ext.save_in_place(ext.T(doc, "IModelDoc2"))
-            
-            self._sw_app.CloseDoc(title)
+                ok, errs, _ = ext.save_in_place(ext.T(doc, "IModelDoc2"))
+                if not ok:
+                    return self._result(False, f"Save before close failed (errors {errs}); "
+                                        f"document left open", SwErrors.swFileSaveError)
+
+            v(self._sw_app, "CloseDoc", title)
             
             return self._result(True, f"Closed: {title}",
                               SwErrors.swSuccess, {"document": title})

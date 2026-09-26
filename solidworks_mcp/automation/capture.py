@@ -13,6 +13,7 @@ import datetime
 from typing import Optional, Dict
 
 from ..constants import SwErrors
+from ..utils.com_helpers import v
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ class ViewCaptureOperations:
 
             if zoom_to_fit:
                 try:
-                    doc.ViewZoomtofit2()
+                    v(doc, "ViewZoomtofit2")
                 except Exception as e:
                     logger.debug(f"ViewZoomtofit2 failed: {e}")
 

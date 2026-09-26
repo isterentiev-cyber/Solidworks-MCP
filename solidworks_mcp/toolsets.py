@@ -96,6 +96,8 @@ TOOLSETS: Dict[str, Set[str]] = {
     },
     # Reading the model back: topology, tree, parameters and equations.
     "analysis": {
+        "get_assembly_tree",
+        "get_component_properties",
         "inspect",
         "list_features",
         "get_parameters",
